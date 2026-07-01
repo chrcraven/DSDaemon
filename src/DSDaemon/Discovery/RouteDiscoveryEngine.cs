@@ -19,6 +19,15 @@ namespace DSDaemon.Discovery {
     /// While Released, the engine also aids the scout by clearing its own path:
     /// see OnSignalsUpdated/OnInterlockErrorsUpdated below.
     ///
+    /// Scout eligibility is based purely on our own _heldByUs bookkeeping, not on
+    /// Run8 echoing TrainData.HoldingForDispatcher back true: on a live session,
+    /// Run8 never confirmed that flag for a dispatcher-issued AI hold, which left
+    /// the engine stuck in WaitingToSelect forever. Trusting our own commanded
+    /// state means scouts get released (and their route's signals/switches get
+    /// cleared) as soon as we've seen the train once, at the cost of occasionally
+    /// releasing a train Run8 hasn't actually finished holding yet — acceptable
+    /// for this discovery-only, single-scout-at-a-time use.
+    ///
     /// Thread-safe: all mutable state is protected by a single lock.
     /// WCF callbacks arrive on concurrent threads (ConcurrencyMode.Multiple).
     /// </summary>
@@ -32,7 +41,8 @@ namespace DSDaemon.Discovery {
 
         // Latest TrainData per train ID.
         private readonly Dictionary<int, TrainData> _trains = new();
-        // Trains we have sent a Hold command to (may not be confirmed yet).
+        // Trains we have sent a Hold command to and treat as held, regardless of
+        // whether Run8 has echoed HoldingForDispatcher=true back to us.
         private readonly HashSet<int> _heldByUs = new();
         // Block → route membership (populated from SetOccupiedBlocks callbacks).
         private readonly Dictionary<int, int> _blockRoute = new();
@@ -49,6 +59,7 @@ namespace DSDaemon.Discovery {
         private int?  _scoutTrainId;
         private int   _scoutFromBlock;
         private int   _scoutRoute;
+        private int?  _lastScoutTrainId;
         private CancellationTokenSource? _timeoutCts;
         private bool  _disposed;
 
@@ -93,8 +104,15 @@ namespace DSDaemon.Discovery {
                     _log($"[DISC] Holding AI train #{train.TrainID} (blk={train.BlockID})", ConsoleColor.DarkYellow);
                 }
 
-                // Newly confirmed as held → maybe now eligible to be a scout.
-                if (_state == DiscoveryState.WaitingToSelect && train.HoldingForDispatcher)
+                // Try to pick a scout any time a train update lands while we're
+                // waiting. We deliberately do NOT gate this on
+                // train.HoldingForDispatcher: in practice Run8 never echoes that
+                // flag back true for AI holds issued by the external dispatcher
+                // (observed over a full live session — every UpdateTrainData for a
+                // held AI train kept reporting HoldingForDispatcher=false forever),
+                // so requiring it left discovery stuck in WaitingToSelect
+                // permanently. We trust our own _heldByUs bookkeeping instead.
+                if (_state == DiscoveryState.WaitingToSelect)
                     TrySelectScout();
 
                 // Scout moved to a new block.
@@ -155,16 +173,37 @@ namespace DSDaemon.Discovery {
         // ── State machine (all called under _lock) ────────────────────────────
 
         private void TrySelectScout() {
+            // Prefer any eligible train other than the one we just finished
+            // scouting, so one fast-moving train doesn't hog every turn. This
+            // matters now that we no longer wait for Run8's hold confirmation
+            // before considering a train eligible again (see OnTrainDataReceived) —
+            // without this, a lone re-held scout would otherwise become eligible
+            // again immediately. Fall back to re-selecting it if it's the only
+            // held AI train around, so a single train still keeps exploring
+            // rather than sitting held forever.
+            if (TrySelectScoutFrom(skipId: _lastScoutTrainId)) return;
+            TrySelectScoutFrom(skipId: null);
+        }
+
+        private bool TrySelectScoutFrom(int? skipId) {
             foreach (var (id, train) in _trains) {
+                if (id == skipId) continue;
                 if (train.EngineerType != EEngineerType.AI) continue;
                 if (train.BlockID == 0) continue;
-                // Require Run8 confirmation AND that we are the one holding it.
-                if (!train.HoldingForDispatcher) continue;
+                // Trust our own hold bookkeeping rather than Run8's
+                // HoldingForDispatcher confirmation — see OnTrainDataReceived.
                 if (!_heldByUs.Contains(id)) continue;
 
-                _scoutTrainId   = id;
-                _scoutFromBlock = train.BlockID;
-                _scoutRoute     = _blockRoute.TryGetValue(train.BlockID, out int r) ? r : 0;
+                _scoutTrainId     = id;
+                _lastScoutTrainId = id;
+                _scoutFromBlock   = train.BlockID;
+                // SetOccupiedBlocks reports raw per-route block numbers (e.g. 231),
+                // but TrainData.BlockID has been observed on live Run8 data as a
+                // composite route*1000+block encoding (e.g. 110231 for route 110,
+                // block 231). Prefer an exact _blockRoute match (covers routes with
+                // raw, non-composite numbering) and fall back to decoding the
+                // composite form otherwise.
+                _scoutRoute     = _blockRoute.TryGetValue(train.BlockID, out int r) ? r : train.BlockID / 1000;
                 _state          = DiscoveryState.Released;
                 _clearedSignalIndices.Clear();
                 _unlockedInterlockSwitches.Clear();
@@ -173,8 +212,9 @@ namespace DSDaemon.Discovery {
                 _log($"[DISC] Scout #{id} released from blk {_scoutFromBlock} (route {_scoutRoute})",
                      ConsoleColor.Yellow);
                 StartTimeout(id);
-                return;
+                return true;
             }
+            return false;
         }
 
         private void RecordTransition(int toBlock) {

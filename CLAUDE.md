@@ -235,6 +235,24 @@ block 101 becomes occupied, you can't tell whether it was train A or train B tha
 Because only one train moves at a time, every block-ID delta is unambiguously attributable
 to the scout.
 
+**Scout eligibility does not wait for Run8 to confirm the hold.** `TrainData.HoldingForDispatcher`
+was originally used to gate scout selection (only pick a train Run8 has echoed back as held), but
+a full live session showed Run8 never sets that flag true for an AI hold issued by the external
+dispatcher — every `UpdateTrainData` for a held train kept reporting it `false` indefinitely, which
+left the engine stuck in `WaitingToSelect` forever and no scout was ever released. The engine now
+tracks "held" purely via its own `_heldByUs` bookkeeping (have we sent the `Hold` command?) and
+does not read `HoldingForDispatcher` for scout-selection purposes at all. When only one AI train is
+around, the timeout/re-hold/re-select cycle (step 5/6) immediately re-releases the same train each
+time rather than leaving it held — see the round-robin note below. `HoldingForDispatcher` is still
+displayed to the operator (`[HELD]` tag / `trains` command) for visibility, it just isn't trusted
+for discovery's own state machine.
+
+**Scout selection is round-robin, not first-eligible.** `TrySelectScout` first tries any eligible
+train *other than* the one most recently scouted, falling back to re-selecting it only if it's the
+only AI train currently held. Without this, a single fast-moving train would keep re-winning
+selection over other already-held trains the instant it's re-held after each move, since (per the
+point above) there's no confirmation delay to naturally give another train a turn.
+
 ### Autonomous path-clearing (aiding the scout)
 
 While a scout is `Released`, `RouteDiscoveryEngine` also clears its own path with no operator
@@ -280,6 +298,19 @@ for general PTC enforcement) without re-deriving that safety argument.
 
 `AdjacentBlocks` maps neighbour block ID → number of times that transition was observed.
 High confidence (≥5) means the edge is reliable. Low confidence (1–2) may be spurious.
+
+### `TrainData.BlockID` vs `OccupiedBlocksMessage.OccupiedBlocks` numbering
+
+Observed on a live session: `SetOccupiedBlocks` reports raw, per-route local block numbers
+(e.g. `[231]` for route 110), but `TrainData.BlockID` for a train sitting in that same block
+came across as a **composite** `route*1000 + localBlock` value (`110231`). The two are not the
+same numbering domain. `RouteDiscoveryEngine` derives the scout's route (used to match
+`SetSignals`/`SetInterlockErrorSwitches` callbacks for auto-clearing, and to key `RouteMap`
+adjacency) by first trying an exact `_blockRoute` lookup (populated from `SetOccupiedBlocks`,
+for routes that turn out to use matching raw numbering) and falling back to `BlockID / 1000`
+otherwise. This is inferred from a single route's data — reconfirm the composite-encoding
+assumption if adjacency/auto-clearing looks wrong on a route with block numbers ≥ 1000 or a
+route ID that doesn't cleanly divide out.
 
 ### Thread safety in RouteDiscoveryEngine
 
