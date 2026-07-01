@@ -9,6 +9,8 @@ sim clock) and displays it to the console with colour-coded output and optional 
 
 **V1 scope: visualization only — no commands sent to Run8 except in discovery mode.**
 **V1.5 scope: empirical route discovery via controlled AI-train scouting.**
+**V2 scope: the dispatcher may issue live commands — signals, switches, and AI
+train orders — via an interactive console, alongside continued route discovery.**
 Scope: Run8 Southern California region (Mojave Sub + Needles Sub).
 
 ## Technology decision (settled — do not reopen)
@@ -52,11 +54,12 @@ DSDaemon/
   CLAUDE.md                         ← you are here
   src/DSDaemon/
     DSDaemon.csproj                 ← net6.0, System.ServiceModel.{Duplex,NetTcp} 4.10.*
-    Program.cs                      ← entry point, arg parsing, reconnect loop, discovery startup
+    Program.cs                      ← entry point, arg parsing, reconnect loop, command console, discovery startup
     Run8Connector.cs                ← WCF channel lifecycle; .Channel exposes IRun8 for commands
     DispatcherCallback.cs           ← IDispatcher impl — logs callbacks; forwards to discovery engine
     PtcMonitor.cs                   ← thread-safe PTC state (signals, blocks, switches, trains)
-    TrainCommander.cs               ← ITrainCommander + TrainCommander (wraps BeginHoldAITrain)
+    DispatcherCommander.cs          ← ITrainCommander/IDispatcherCommander — wraps all outbound IRun8 commands
+    CommandConsole.cs               ← parses operator stdin lines, dispatches to IDispatcherCommander
     Contracts/
       IDispatcher.cs                ← callback interface (must match Run8 wire contract)
       IRun8.cs                      ← service interface ([ServiceContract(Name="IWCFRun8")])
@@ -93,6 +96,7 @@ DSDaemon/
     Helpers/
       TrainBuilder.cs               ← builds TrainData for tests
       MessageBuilder.cs             ← builds signal/switch/block messages
+      FakeRun8.cs                   ← records outbound commands for DispatcherCommander tests
     Scenarios/
       OverspeedTests.cs
       BlockOccupancyTests.cs
@@ -101,6 +105,8 @@ DSDaemon/
       PermissionTests.cs
       TrainDisplayTests.cs
       RouteDiscoveryTests.cs        ← discovery state machine + RouteMap unit tests
+      DispatcherCommanderTests.cs   ← verifies each command sends the right WCF message
+      CommandConsoleTests.cs        ← verifies operator command-line parsing/dispatch
 ```
 
 ## Critical wire-format detail: TrainData backing fields
@@ -144,6 +150,31 @@ DSDaemon [--host <h>] [--port <p>] [--log-file <path>] [--discover] [--route-map
 ```
 
 Start Run8 first. Launch DSDaemon; it will reconnect automatically on channel fault.
+
+## Interactive dispatcher commands (v2)
+
+Once connected, DSDaemon reads commands from stdin (concurrently with the live callback
+display) and dispatches them through `DispatcherCommander` → `IRun8`:
+
+```
+signal <id> <stop|proceed|fleet|flagby> [auto]  Change a signal indication
+switch <id> <normal|reverse|unlock|relock>      Throw/lock a switch
+hold <trainId>                                  Hold an AI train
+release <trainId>                               Release a held AI train
+stop <trainId>                                  Stop an AI train immediately
+recrew <trainId>                                Recrew an AI train
+relinquish <trainId> [on|off]                   Relinquish AI control (default on)
+trains                                          List known trains
+help                                             Show this help
+quit | exit                                     Shut down DSDaemon
+```
+
+Commands are parsed and dispatched by `CommandConsole.Execute`, which is independent of
+the stdin loop so it can be unit tested without a real console (see `CommandConsoleTests`).
+When `--discover` is also active, both features share the same `DispatcherCommander`
+instance — the discovery engine's scouting holds/releases and manual operator commands can
+both be in flight; there's no coordination between them, so a manual `release` on a train
+the discovery engine is currently holding as non-scout will interfere with scouting.
 
 ## Route discovery mode (v1.5)
 
@@ -222,8 +253,11 @@ DSDaemon is built around **PTC** as its core safety and dispatch model:
   states for the same route; if a block is occupied and the approach signal is
   `Proceed` or `Fleet`, that is a potential authority conflict worth flagging.
 
-In v1 these are display-only observations. In v2+ the app can issue `BeginHoldAITrain`
-or `BeginStopAITrain` to enforce PTC authority limits on AI trains.
+These evaluations remain display-only — DSDaemon does not yet automatically issue
+`BeginHoldAITrain`/`BeginStopAITrain`/`BeginChangeSignal`/`BeginThrowSwitch` in response
+to a detected conflict. V2 makes the full command surface available to a human dispatcher
+via the interactive console (see above); automatic PTC enforcement is still a planned
+next step.
 
 ## Planned next steps (v2+)
 
@@ -231,4 +265,6 @@ or `BeginStopAITrain` to enforce PTC authority limits on AI trains.
 - Sub-area filtering for Mojave Sub vs Needles Sub (Route IDs)
 - File logging structured as newline-delimited JSON for downstream tooling
 - SQLite state store so the display survives reconnects without flicker
-- Optional outbound commands (signal/switch control, AI train orders)
+- Automatic PTC enforcement: issue `BeginHoldAITrain`/`BeginStopAITrain`/
+  `BeginChangeSignal` in response to a detected authority conflict, rather than only
+  flagging it
