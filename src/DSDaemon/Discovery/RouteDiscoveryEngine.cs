@@ -15,9 +15,16 @@ namespace DSDaemon.Discovery {
     ///   WaitingToSelect — picks the next eligible held scout and releases it.
     ///   Released       — watches for the scout's BlockID to change; on change
     ///                    records the adjacency, re-holds the scout, selects next.
+    ///                    The optional onAdjacencyRecorded callback fires after each
+    ///                    recorded edge so the caller can persist the map incrementally
+    ///                    rather than only at clean shutdown.
     ///
     /// While Released, the engine also aids the scout by clearing its own path:
-    /// see OnSignalsUpdated/OnInterlockErrorsUpdated below.
+    /// see OnSignalsUpdated/OnInterlockErrorsUpdated below. Since Run8 only pushes
+    /// those callbacks on change, scout selection also seeds the clear from the
+    /// last-known signal/interlock state for the route, so a signal that was
+    /// already red before release still gets cleared instead of stranding the
+    /// scout until its timeout.
     ///
     /// Scout eligibility is based purely on our own _heldByUs bookkeeping, not on
     /// Run8 echoing TrainData.HoldingForDispatcher back true: on a live session,
@@ -37,6 +44,7 @@ namespace DSDaemon.Discovery {
         private readonly IDispatcherCommander _commander;
         private readonly TimeSpan _scoutTimeout;
         private readonly Action<string, ConsoleColor> _log;
+        private readonly Action? _onAdjacencyRecorded;
         private readonly object _lock = new();
 
         // Latest TrainData per train ID.
@@ -54,6 +62,14 @@ namespace DSDaemon.Discovery {
         // Switch IDs already unlocked for the current scouting run (these are
         // genuine wire IDs — InterlockErrorSwitches reports real SwitchIDs).
         private readonly HashSet<int> _unlockedInterlockSwitches = new();
+        // Latest SetSignals/SetInterlockErrorSwitches payload seen per route, kept
+        // regardless of discovery state. Run8 only pushes these callbacks on
+        // change, so if a signal was already Stop before a scout was released on
+        // that route, no new callback ever arrives to trigger the auto-clear —
+        // the scout would then sit at red until the scout timeout. Caching lets
+        // scout selection seed the clear immediately from the last-known state.
+        private readonly Dictionary<int, SignalsMessage> _lastSignalsByRoute = new();
+        private readonly Dictionary<int, InterlockErrorSwitchesMessage> _lastInterlockErrorsByRoute = new();
 
         private DiscoveryState _state = DiscoveryState.Initializing;
         private int?  _scoutTrainId;
@@ -70,11 +86,13 @@ namespace DSDaemon.Discovery {
             RouteMap map,
             IDispatcherCommander commander,
             TimeSpan scoutTimeout = default,
-            Action<string, ConsoleColor>? log = null) {
-            _map          = map;
-            _commander    = commander;
-            _scoutTimeout = scoutTimeout == default ? TimeSpan.FromSeconds(30) : scoutTimeout;
-            _log          = log ?? ((_, _) => { });
+            Action<string, ConsoleColor>? log = null,
+            Action? onAdjacencyRecorded = null) {
+            _map                 = map;
+            _commander           = commander;
+            _scoutTimeout        = scoutTimeout == default ? TimeSpan.FromSeconds(30) : scoutTimeout;
+            _log                 = log ?? ((_, _) => { });
+            _onAdjacencyRecorded = onAdjacencyRecorded;
         }
 
         // ── Public entry points ───────────────────────────────────────────────
@@ -138,16 +156,22 @@ namespace DSDaemon.Discovery {
         /// </summary>
         public void OnSignalsUpdated(SignalsMessage msg) {
             lock (_lock) {
-                if (_disposed || _state != DiscoveryState.Released) return;
-                if (msg.Route != _scoutRoute || msg.Signals == null) return;
+                if (_disposed) return;
+                _lastSignalsByRoute[msg.Route] = msg;
+                if (_state != DiscoveryState.Released || msg.Route != _scoutRoute) return;
+                ClearStopSignals(msg);
+            }
+        }
 
-                for (int i = 0; i < msg.Signals.Count; i++) {
-                    if (msg.Signals[i] != ESignalIndication.Stop) continue;
-                    if (!_clearedSignalIndices.Add(i)) continue;
-                    _commander.ChangeSignal(i, ESignalIndication.Proceed, automaticWorking: true);
-                    _log($"[DISC-AUTO] route {msg.Route}: signal {i} Stop→Proceed (aiding scout #{_scoutTrainId})",
-                         ConsoleColor.DarkCyan);
-                }
+        /// <summary>Must be called under _lock.</summary>
+        private void ClearStopSignals(SignalsMessage msg) {
+            if (msg.Signals == null) return;
+            for (int i = 0; i < msg.Signals.Count; i++) {
+                if (msg.Signals[i] != ESignalIndication.Stop) continue;
+                if (!_clearedSignalIndices.Add(i)) continue;
+                _commander.ChangeSignal(i, ESignalIndication.Proceed, automaticWorking: true);
+                _log($"[DISC-AUTO] route {msg.Route}: signal {i} Stop→Proceed (aiding scout #{_scoutTrainId})",
+                     ConsoleColor.DarkCyan);
             }
         }
 
@@ -158,15 +182,21 @@ namespace DSDaemon.Discovery {
         /// </summary>
         public void OnInterlockErrorsUpdated(InterlockErrorSwitchesMessage msg) {
             lock (_lock) {
-                if (_disposed || _state != DiscoveryState.Released) return;
-                if (msg.Route != _scoutRoute || msg.InterlockErrorSwitches == null) return;
+                if (_disposed) return;
+                _lastInterlockErrorsByRoute[msg.Route] = msg;
+                if (_state != DiscoveryState.Released || msg.Route != _scoutRoute) return;
+                ClearInterlockErrors(msg);
+            }
+        }
 
-                foreach (var switchId in msg.InterlockErrorSwitches) {
-                    if (!_unlockedInterlockSwitches.Add(switchId)) continue;
-                    _commander.ThrowSwitch(switchId, ESwitchState.Unlock);
-                    _log($"[DISC-AUTO] route {msg.Route}: switch {switchId} unlocked (interlock error, aiding scout #{_scoutTrainId})",
-                         ConsoleColor.DarkCyan);
-                }
+        /// <summary>Must be called under _lock.</summary>
+        private void ClearInterlockErrors(InterlockErrorSwitchesMessage msg) {
+            if (msg.InterlockErrorSwitches == null) return;
+            foreach (var switchId in msg.InterlockErrorSwitches) {
+                if (!_unlockedInterlockSwitches.Add(switchId)) continue;
+                _commander.ThrowSwitch(switchId, ESwitchState.Unlock);
+                _log($"[DISC-AUTO] route {msg.Route}: switch {switchId} unlocked (interlock error, aiding scout #{_scoutTrainId})",
+                     ConsoleColor.DarkCyan);
             }
         }
 
@@ -211,6 +241,18 @@ namespace DSDaemon.Discovery {
                 _commander.Release(id);
                 _log($"[DISC] Scout #{id} released from blk {_scoutFromBlock} (route {_scoutRoute})",
                      ConsoleColor.Yellow);
+
+                // Seed clearing from the last-known state for this route: Run8
+                // only pushes SetSignals/SetInterlockErrorSwitches on change, so
+                // if the scout's route was already red/interlocked before
+                // release, no fresh callback would ever arrive to trigger the
+                // auto-clear otherwise, and the scout would sit stuck until the
+                // scout timeout re-holds it.
+                if (_lastSignalsByRoute.TryGetValue(_scoutRoute, out var cachedSignals))
+                    ClearStopSignals(cachedSignals);
+                if (_lastInterlockErrorsByRoute.TryGetValue(_scoutRoute, out var cachedErrors))
+                    ClearInterlockErrors(cachedErrors);
+
                 StartTimeout(id);
                 return true;
             }
@@ -227,6 +269,7 @@ namespace DSDaemon.Discovery {
 
             _map.RecordAdjacency(route, fromBlock, toBlock);
             _log($"[DISC] route {route}: blk {fromBlock} ↔ {toBlock} (train #{trainId})", ConsoleColor.Green);
+            _onAdjacencyRecorded?.Invoke();
 
             _heldByUs.Add(trainId);
             _commander.Hold(trainId);

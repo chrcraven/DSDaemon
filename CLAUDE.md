@@ -273,6 +273,17 @@ Both only ever touch the scout's own route, and each signal index / switch ID is
 commanded once per scouting run (tracked in `_clearedSignalIndices` / `_unlockedInterlockSwitches`,
 reset whenever a new scout is selected) to avoid spamming Run8 on every repeated callback.
 
+**Auto-clearing is seeded at scout selection, not just reactive.** `SetSignals`/
+`SetInterlockErrorSwitches` are pushed by Run8 only on change. If a signal was already `Stop`
+(or a switch already interlock-errored) on a route *before* its scout was released, no new
+callback would ever arrive to trigger the reactive clearing above — the scout would then sit
+at red until the 30 s scout timeout re-holds it. To fix this, the engine caches the latest
+`SignalsMessage`/`InterlockErrorSwitchesMessage` per route (`_lastSignalsByRoute` /
+`_lastInterlockErrorsByRoute`, updated on every callback regardless of discovery state) and,
+at the moment a new scout is released in `TrySelectScoutFrom`, immediately re-applies the
+clear from that cached state for the scout's route — in addition to the ongoing reactive
+clearing on subsequent live callbacks.
+
 This is judged safe *only* because discovery holds every other train — with just the scout
 moving on its route, forcing every signal on that route clear cannot create a real conflicting
 movement authority. This autonomous clearing must not be reused outside discovery mode (e.g.
@@ -298,6 +309,17 @@ for general PTC enforcement) without re-deriving that safety argument.
 
 `AdjacentBlocks` maps neighbour block ID → number of times that transition was observed.
 High confidence (≥5) means the edge is reliable. Low confidence (1–2) may be spurious.
+
+**Persistence is incremental, not just on clean exit.** `RouteDiscoveryEngine` takes an
+optional `onAdjacencyRecorded` callback, invoked synchronously (still under the engine's own
+lock) every time `RecordTransition` records a new edge. `Program.cs` wires this to save
+`route-map.json` on every discovered edge, so a crash or `kill` mid-session doesn't lose
+accumulated discovery — the previous behaviour only wrote the file once, after the reconnect
+loop exited on Ctrl+C. The save must run under the engine's lock (not dispatched to a
+background task) because `RouteMap.Routes` isn't synchronized against its own mutation — a
+save racing a concurrent `RecordAdjacency` on another WCF callback thread would be an
+unguarded concurrent read/write of the same dictionary. The final save at clean shutdown is
+kept too, mostly for a definitive "saved" log line.
 
 ### `TrainData.BlockID` vs `OccupiedBlocksMessage.OccupiedBlocks` numbering
 
