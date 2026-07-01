@@ -63,7 +63,7 @@ namespace DSDaemon.Discovery {
             _map          = map;
             _commander    = commander;
             _scoutTimeout = scoutTimeout == default ? TimeSpan.FromSeconds(30) : scoutTimeout;
-            _log          = log ?? static (_, _) => { };
+            _log          = log ?? ((_, _) => { });
         }
 
         // ── Public entry points ───────────────────────────────────────────────
