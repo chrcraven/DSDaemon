@@ -88,14 +88,16 @@ namespace DSDaemon.Tests.Scenarios {
         // ── Start() transition ────────────────────────────────────────────────
 
         [Fact]
-        public void Start_WithNoConfirmedTrains_StaysWaiting() {
+        public void Start_DoesNotWaitForRun8Confirmation_ReleasesScout() {
             var (eng, _, _) = Make();
-            // See an AI train but don't confirm it held yet.
+            // Run8 has not echoed HoldingForDispatcher=true for this train — on a
+            // real session it never does for dispatcher-issued AI holds, so the
+            // engine must not wait for it and should release anyway.
             eng.OnTrainDataReceived(AI(1, 100, held: false));
             eng.Start();
 
-            Assert.Equal(DiscoveryState.WaitingToSelect, eng.State);
-            Assert.Null(eng.ScoutTrainId);
+            Assert.Equal(DiscoveryState.Released, eng.State);
+            Assert.Equal(1, eng.ScoutTrainId);
         }
 
         [Fact]
@@ -144,20 +146,25 @@ namespace DSDaemon.Tests.Scenarios {
 
             eng.OnTrainDataReceived(AI(1, 200, held: false));
 
-            // Commands: Hold(init), Release(scout), Hold(re-hold after move).
-            Assert.Equal(3, cmdr.Commands.Count);
+            // Commands: Hold(init), Release(scout), Hold(re-hold after move),
+            // Release(re-scouted immediately — it's the only train around, so it
+            // keeps exploring rather than sitting held forever).
+            Assert.Equal(4, cmdr.Commands.Count);
             Assert.Equal((1, true), cmdr.Commands[2]);
+            Assert.Equal((1, false), cmdr.Commands[3]);
         }
 
         [Fact]
-        public void ScoutBlockChange_ReturnsToWaiting_WithNoNextScout() {
+        public void ScoutBlockChange_LoneTrain_ImmediatelyRescouted() {
             var (eng, _, _) = Make();
             eng.OnTrainDataReceived(AI(1, 100, held: true));
             eng.Start();
             eng.OnTrainDataReceived(AI(1, 200, held: false));
 
-            Assert.Equal(DiscoveryState.WaitingToSelect, eng.State);
-            Assert.Null(eng.ScoutTrainId);
+            // With no other train to give a turn to, the lone train keeps
+            // exploring rather than being left held indefinitely.
+            Assert.Equal(DiscoveryState.Released, eng.State);
+            Assert.Equal(1, eng.ScoutTrainId);
         }
 
         [Fact]
@@ -167,15 +174,11 @@ namespace DSDaemon.Tests.Scenarios {
             eng.OnTrainDataReceived(AI(2, 200, held: true));
             eng.Start(); // picks train #1 as scout (first found)
 
-            // Train #1 moves; train #2 is still held → becomes next scout.
+            // Train #1 moves; the engine re-holds #1 and, since #2 is still
+            // eligible, picks #2 as the next scout in the same synchronous call
+            // (round-robin skips the just-finished scout when another train is
+            // available — see TrySelectScout).
             eng.OnTrainDataReceived(AI(1, 150, held: false));
-            eng.OnTrainDataReceived(AI(2, 200, held: true)); // re-confirm #2 still held
-
-            // After block transition #1→150, engine re-holds #1 and immediately
-            // tries to select #2 as the next scout — but #2's data was set before
-            // the transition, so a subsequent confirmed-held message is needed.
-            // Simulate that now:
-            eng.OnTrainDataReceived(AI(2, 200, held: true));
 
             Assert.Equal(DiscoveryState.Released, eng.State);
             Assert.Equal(2, eng.ScoutTrainId);
@@ -210,6 +213,27 @@ namespace DSDaemon.Tests.Scenarios {
 
             Assert.Equal(1, map.GetAdjacencyConfidence(1, 500, 501));
             Assert.Equal(0, map.GetAdjacencyConfidence(0, 500, 501)); // not on route 0
+        }
+
+        [Fact]
+        public void CompositeBlockId_RouteDecodedFromBlockId_WhenNoOccupiedBlocksSeen() {
+            // Live Run8 data has been observed encoding TrainData.BlockID as
+            // route*1000 + localBlock (e.g. 110231 for route 110, block 231),
+            // while SetOccupiedBlocks reports the raw local block number (231).
+            // Without a matching _blockRoute entry, the engine should decode the
+            // route straight from the composite BlockID so auto-clearing (which
+            // matches on msg.Route) still fires for the scout's real route.
+            var (eng, _, cmdr) = Make();
+            eng.OnTrainDataReceived(AI(1, 110231, held: true));
+            eng.Start(); // releases scout on route 110 (decoded from 110231 / 1000)
+
+            eng.OnSignalsUpdated(new SignalsMessage {
+                Route = 110,
+                Signals = new List<ESignalIndication> { ESignalIndication.Stop },
+            });
+
+            var change = Assert.Single(cmdr.SignalsChanged);
+            Assert.Equal((0, ESignalIndication.Proceed, true), change);
         }
 
         // ── Autonomous signal/switch clearing (aiding the released scout) ──────
@@ -320,17 +344,34 @@ namespace DSDaemon.Tests.Scenarios {
         // ── Timeout ───────────────────────────────────────────────────────────
 
         [Fact]
-        public async Task ScoutTimeout_ScoutReHeld() {
+        public async Task ScoutTimeout_LoneTrain_ImmediatelyRescouted() {
             var (eng, _, cmdr) = Make(timeout: TimeSpan.FromMilliseconds(30));
             eng.OnTrainDataReceived(AI(1, 100, held: true));
             eng.Start(); // releases scout
 
             await Task.Delay(100); // let timeout fire
 
-            Assert.Equal(DiscoveryState.WaitingToSelect, eng.State);
-            // Commands: Hold, Release, Hold (timeout re-hold).
-            Assert.Equal(3, cmdr.Commands.Count);
+            // With no other train around, a timed-out scout is immediately
+            // re-released rather than left held forever.
+            Assert.Equal(DiscoveryState.Released, eng.State);
+            Assert.Equal(1, eng.ScoutTrainId);
+            // Commands: Hold, Release, Hold (timeout re-hold), Release (re-scouted).
+            Assert.Equal(4, cmdr.Commands.Count);
             Assert.Equal((1, true), cmdr.Commands[2]);
+            Assert.Equal((1, false), cmdr.Commands[3]);
+        }
+
+        [Fact]
+        public async Task ScoutTimeout_OtherTrainAvailable_BecomesNextScout() {
+            var (eng, _, cmdr) = Make(timeout: TimeSpan.FromMilliseconds(30));
+            eng.OnTrainDataReceived(AI(1, 100, held: true));
+            eng.OnTrainDataReceived(AI(2, 200, held: true));
+            eng.Start(); // releases scout #1
+
+            await Task.Delay(100); // let #1's timeout fire
+
+            Assert.Equal(DiscoveryState.Released, eng.State);
+            Assert.Equal(2, eng.ScoutTrainId);
         }
 
         [Fact]
