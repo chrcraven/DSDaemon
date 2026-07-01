@@ -16,13 +16,16 @@ namespace DSDaemon.Discovery {
     ///   Released       — watches for the scout's BlockID to change; on change
     ///                    records the adjacency, re-holds the scout, selects next.
     ///
+    /// While Released, the engine also aids the scout by clearing its own path:
+    /// see OnSignalsUpdated/OnInterlockErrorsUpdated below.
+    ///
     /// Thread-safe: all mutable state is protected by a single lock.
     /// WCF callbacks arrive on concurrent threads (ConcurrencyMode.Multiple).
     /// </summary>
     public sealed class RouteDiscoveryEngine : IDisposable {
 
         private readonly RouteMap _map;
-        private readonly ITrainCommander _commander;
+        private readonly IDispatcherCommander _commander;
         private readonly TimeSpan _scoutTimeout;
         private readonly Action<string, ConsoleColor> _log;
         private readonly object _lock = new();
@@ -33,6 +36,14 @@ namespace DSDaemon.Discovery {
         private readonly HashSet<int> _heldByUs = new();
         // Block → route membership (populated from SetOccupiedBlocks callbacks).
         private readonly Dictionary<int, int> _blockRoute = new();
+        // Signal indices already commanded to Proceed for the current scouting run
+        // (SignalsMessage carries no ID — we treat list position as SignalID, an
+        // assumption unverified against the real Run8 wire behaviour; watch for
+        // "[DISC-AUTO]" log lines and the following SetSignals callback to confirm).
+        private readonly HashSet<int> _clearedSignalIndices = new();
+        // Switch IDs already unlocked for the current scouting run (these are
+        // genuine wire IDs — InterlockErrorSwitches reports real SwitchIDs).
+        private readonly HashSet<int> _unlockedInterlockSwitches = new();
 
         private DiscoveryState _state = DiscoveryState.Initializing;
         private int?  _scoutTrainId;
@@ -46,7 +57,7 @@ namespace DSDaemon.Discovery {
 
         public RouteDiscoveryEngine(
             RouteMap map,
-            ITrainCommander commander,
+            IDispatcherCommander commander,
             TimeSpan scoutTimeout = default,
             Action<string, ConsoleColor>? log = null) {
             _map          = map;
@@ -101,6 +112,46 @@ namespace DSDaemon.Discovery {
             }
         }
 
+        /// <summary>
+        /// Aids the released scout by forcing any Stop signal on its route to
+        /// Proceed. Safe only because discovery holds every other train — with
+        /// just the scout moving on this route, clearing every signal on it
+        /// cannot create a real conflicting movement authority.
+        /// </summary>
+        public void OnSignalsUpdated(SignalsMessage msg) {
+            lock (_lock) {
+                if (_disposed || _state != DiscoveryState.Released) return;
+                if (msg.Route != _scoutRoute || msg.Signals == null) return;
+
+                for (int i = 0; i < msg.Signals.Count; i++) {
+                    if (msg.Signals[i] != ESignalIndication.Stop) continue;
+                    if (!_clearedSignalIndices.Add(i)) continue;
+                    _commander.ChangeSignal(i, ESignalIndication.Proceed, automaticWorking: true);
+                    _log($"[DISC-AUTO] route {msg.Route}: signal {i} Stop→Proceed (aiding scout #{_scoutTrainId})",
+                         ConsoleColor.DarkCyan);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Aids the released scout by unlocking any switch reporting an
+        /// interlock error on its route — a genuine wire SwitchID, unlike
+        /// signal indices, so this is unambiguous.
+        /// </summary>
+        public void OnInterlockErrorsUpdated(InterlockErrorSwitchesMessage msg) {
+            lock (_lock) {
+                if (_disposed || _state != DiscoveryState.Released) return;
+                if (msg.Route != _scoutRoute || msg.InterlockErrorSwitches == null) return;
+
+                foreach (var switchId in msg.InterlockErrorSwitches) {
+                    if (!_unlockedInterlockSwitches.Add(switchId)) continue;
+                    _commander.ThrowSwitch(switchId, ESwitchState.Unlock);
+                    _log($"[DISC-AUTO] route {msg.Route}: switch {switchId} unlocked (interlock error, aiding scout #{_scoutTrainId})",
+                         ConsoleColor.DarkCyan);
+                }
+            }
+        }
+
         // ── State machine (all called under _lock) ────────────────────────────
 
         private void TrySelectScout() {
@@ -115,6 +166,8 @@ namespace DSDaemon.Discovery {
                 _scoutFromBlock = train.BlockID;
                 _scoutRoute     = _blockRoute.TryGetValue(train.BlockID, out int r) ? r : 0;
                 _state          = DiscoveryState.Released;
+                _clearedSignalIndices.Clear();
+                _unlockedInterlockSwitches.Clear();
                 _heldByUs.Remove(id);
                 _commander.Release(id);
                 _log($"[DISC] Scout #{id} released from blk {_scoutFromBlock} (route {_scoutRoute})",

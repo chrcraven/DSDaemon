@@ -172,9 +172,11 @@ quit | exit                                     Shut down DSDaemon
 Commands are parsed and dispatched by `CommandConsole.Execute`, which is independent of
 the stdin loop so it can be unit tested without a real console (see `CommandConsoleTests`).
 When `--discover` is also active, both features share the same `DispatcherCommander`
-instance — the discovery engine's scouting holds/releases and manual operator commands can
-both be in flight; there's no coordination between them, so a manual `release` on a train
-the discovery engine is currently holding as non-scout will interfere with scouting.
+instance — the discovery engine's scouting holds/releases, its autonomous signal/switch
+clearing (see below), and manual operator commands can all be in flight concurrently; there's
+no coordination between them, so a manual `release` on a train the discovery engine is
+currently holding as non-scout will interfere with scouting, and a manual `signal`/`switch`
+command on the scout's route may race with the engine's own auto-clearing.
 
 ## Route discovery mode (v1.5)
 
@@ -203,6 +205,31 @@ block 101 becomes occupied, you can't tell whether it was train A or train B tha
 
 Because only one train moves at a time, every block-ID delta is unambiguously attributable
 to the scout.
+
+### Autonomous path-clearing (aiding the scout)
+
+While a scout is `Released`, `RouteDiscoveryEngine` also clears its own path with no operator
+involvement, via the full `IDispatcherCommander` (not just `ITrainCommander`):
+
+- **Signals**: on `SetSignals` for the scout's route, any signal reported `Stop` is immediately
+  commanded to `Proceed` (`ChangeSignal(index, Proceed, automaticWorking: true)`). This relies
+  on an **unverified assumption**: `SignalsMessage.Signals` carries no ID, only a per-route
+  positional list, so the engine treats list index as `SignalID`. It's safe to get wrong (Run8
+  presumably no-ops on an unrecognized ID) but may simply have no effect — watch for
+  `[DISC-AUTO]` log lines and confirm the following `SetSignals` callback actually flips to
+  `Proceed` before trusting this on a new region.
+- **Switches**: on `SetInterlockErrorSwitches` for the scout's route, every switch ID reported
+  is commanded `Unlock`. Unlike signals, these are genuine wire `SwitchID`s (the same IDs
+  reported in `ReversedSwitches`/`UnlockedSwitches`), so this is unambiguous.
+
+Both only ever touch the scout's own route, and each signal index / switch ID is only
+commanded once per scouting run (tracked in `_clearedSignalIndices` / `_unlockedInterlockSwitches`,
+reset whenever a new scout is selected) to avoid spamming Run8 on every repeated callback.
+
+This is judged safe *only* because discovery holds every other train — with just the scout
+moving on its route, forcing every signal on that route clear cannot create a real conflicting
+movement authority. This autonomous clearing must not be reused outside discovery mode (e.g.
+for general PTC enforcement) without re-deriving that safety argument.
 
 ### RouteMap format (route-map.json)
 

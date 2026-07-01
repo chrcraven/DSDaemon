@@ -53,6 +53,7 @@ namespace DSDaemon {
 
         public void SetSignals(SignalsMessage m) {
             _monitor.UpdateSignals(m);
+            _discovery?.OnSignalsUpdated(m);
             if (m.Signals == null || m.Signals.Count == 0) return;
 
             var counts = new Dictionary<ESignalIndication, int>();
@@ -118,6 +119,7 @@ namespace DSDaemon {
 
         public void SetInterlockErrorSwitches(InterlockErrorSwitchesMessage m) {
             _monitor.UpdateInterlockErrors(m);
+            _discovery?.OnInterlockErrorsUpdated(m);
             int count = m.InterlockErrorSwitches?.Count ?? 0;
             if (count == 0) return;
             _write($"[SW-ERR] route={m.Route}  count={count}  [{string.Join(",", m.InterlockErrorSwitches!)}]",
