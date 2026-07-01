@@ -54,11 +54,11 @@ void Log(string message, ConsoleColor color = ConsoleColor.White) {
 }
 
 // ── Banner ────────────────────────────────────────────────────────────────────
-Log("DSDaemon — Run8 Southern California External Dispatcher (v1 console prototype)", ConsoleColor.Cyan);
+Log("DSDaemon — Run8 Southern California External Dispatcher (v2 console prototype)", ConsoleColor.Cyan);
 Log($"Target: net.tcp://{host}:{port}/Run8", ConsoleColor.Gray);
 if (logPath      != null) Log($"Logging to:   {logPath}",      ConsoleColor.Gray);
 if (discoverMode)          Log($"Discovery ON  route-map: {routeMapPath}", ConsoleColor.Cyan);
-Log("Press Ctrl+C to exit", ConsoleColor.Gray);
+Log("Press Ctrl+C to exit. Type 'help' for dispatcher commands.", ConsoleColor.Gray);
 Log(new string('─', 80), ConsoleColor.DarkGray);
 
 // Load route map once; persist across reconnects.
@@ -72,6 +72,34 @@ Console.CancelKeyPress += (_, e) => {
     cts.Cancel();
 };
 
+// ── Interactive dispatcher command console ────────────────────────────────────
+// Runs for the life of the process; targets whichever commander/monitor is
+// "live" for the current connection (updated on connect/disconnect below).
+IDispatcherCommander? activeCommander = null;
+PtcMonitor?           activeMonitor   = null;
+
+_ = Task.Run(() => {
+    while (!cts.Token.IsCancellationRequested) {
+        string? line;
+        try { line = Console.ReadLine(); }
+        catch { break; }
+        if (line == null) break; // stdin closed (e.g. redirected/non-interactive)
+        if (string.IsNullOrWhiteSpace(line)) continue;
+
+        var commander = activeCommander;
+        var monitor   = activeMonitor;
+        if (commander == null || monitor == null) {
+            Log("[CMD] Not connected to Run8 yet.", ConsoleColor.DarkYellow);
+            continue;
+        }
+
+        if (CommandConsole.Execute(line, commander, monitor, Log)) {
+            cts.Cancel();
+            break;
+        }
+    }
+});
+
 bool reconnect = true;
 while (reconnect && !cts.Token.IsCancellationRequested) {
     var monitor  = new PtcMonitor();
@@ -81,8 +109,11 @@ while (reconnect && !cts.Token.IsCancellationRequested) {
     try {
         connector.Connect();
 
+        var commander = new DispatcherCommander(connector.Channel!);
+        activeCommander = commander;
+        activeMonitor   = monitor;
+
         if (routeMap != null) {
-            var commander = new TrainCommander(connector.Channel!);
             discovery = new RouteDiscoveryEngine(routeMap, commander, log: Log);
             callback.SetDiscoveryEngine(discovery);
             // Allow 5 s for the initial flood of UpdateTrainData callbacks before scouting.
@@ -105,6 +136,8 @@ while (reconnect && !cts.Token.IsCancellationRequested) {
             catch (OperationCanceledException) { reconnect = false; }
         }
     } finally {
+        activeCommander = null;
+        activeMonitor   = null;
         discovery?.Dispose();
     }
 }
