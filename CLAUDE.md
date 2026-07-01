@@ -144,12 +144,18 @@ DSDaemon [--host <h>] [--port <p>] [--log-file <path>] [--discover] [--route-map
 
   --host       Run8 host (default: localhost)
   --port       Run8 WCF port (default: 15192)
-  --log-file   Append timestamped output to this file as well as console
+  --log-file   Override the log file path (default: dsdaemon-<timestamp>.log)
   --discover   Enable empirical route discovery mode (issues BeginHoldAITrain commands)
   --route-map  JSON path to persist the growing route map (default: route-map.json)
 ```
 
 Start Run8 first. Launch DSDaemon; it will reconnect automatically on channel fault.
+
+Every run always writes a log file (mirroring everything shown on the console) — by
+default a fresh timestamped `dsdaemon-<timestamp>.log` in the working directory, so
+a run's full output is available afterward (e.g. to hand back for debugging) even if
+nobody was watching the console live. `--log-file` overrides the path and appends to
+it instead of starting fresh.
 
 ## Interactive dispatcher commands (v2)
 

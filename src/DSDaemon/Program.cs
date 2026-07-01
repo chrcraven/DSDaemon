@@ -8,7 +8,8 @@ using DSDaemon.Discovery;
 // ── Parse arguments ──────────────────────────────────────────────────────────
 string  host         = "localhost";
 int     port         = 15192;
-string? logPath      = null;
+string  logPath      = $"dsdaemon-{DateTime.Now:yyyyMMdd-HHmmss}.log";
+bool    logPathSet   = false;
 bool    discoverMode = false;
 string  routeMapPath = "route-map.json";
 
@@ -16,7 +17,7 @@ for (int i = 0; i < args.Length; i++) {
     switch (args[i]) {
         case "--host"      when i + 1 < args.Length: host         = args[++i]; break;
         case "--port"      when i + 1 < args.Length: port         = int.Parse(args[++i]); break;
-        case "--log-file"  when i + 1 < args.Length: logPath      = args[++i]; break;
+        case "--log-file"  when i + 1 < args.Length: logPath      = args[++i]; logPathSet = true; break;
         case "--route-map" when i + 1 < args.Length: routeMapPath = args[++i]; break;
         case "--discover":  discoverMode = true; break;
         case "-h":
@@ -26,6 +27,8 @@ for (int i = 0; i < args.Length; i++) {
             Console.WriteLine("  --host       Run8 host (default: localhost)");
             Console.WriteLine($"  --port       Run8 WCF port (default: {port})");
             Console.WriteLine("  --log-file   Append all output to this file as well");
+            Console.WriteLine($"               (default: dsdaemon-<timestamp>.log — always written, so a");
+            Console.WriteLine( "               run's output can be handed back for debugging)");
             Console.WriteLine("  --discover   Enable empirical route discovery mode");
             Console.WriteLine("  --route-map  Route map JSON path (default: route-map.json)");
             return;
@@ -33,12 +36,14 @@ for (int i = 0; i < args.Length; i++) {
 }
 
 // ── Logging ───────────────────────────────────────────────────────────────────
-StreamWriter? fileWriter = null;
-if (logPath != null) {
-    fileWriter = new StreamWriter(logPath, append: true, encoding: System.Text.Encoding.UTF8) {
-        AutoFlush = true,
-    };
-}
+// Always writes to a file — by default a fresh timestamped one per run — so the
+// full session output is available to hand back for debugging even when nobody
+// was watching the console live.
+var logDir = Path.GetDirectoryName(logPath);
+if (!string.IsNullOrEmpty(logDir)) Directory.CreateDirectory(logDir);
+var fileWriter = new StreamWriter(logPath, append: logPathSet, encoding: System.Text.Encoding.UTF8) {
+    AutoFlush = true,
+};
 
 var consoleLock = new object();
 
@@ -50,13 +55,13 @@ void Log(string message, ConsoleColor color = ConsoleColor.White) {
         Console.WriteLine(line);
         Console.ForegroundColor = prev;
     }
-    fileWriter?.WriteLine(line);
+    fileWriter.WriteLine(line);
 }
 
 // ── Banner ────────────────────────────────────────────────────────────────────
 Log("DSDaemon — Run8 Southern California External Dispatcher (v2 console prototype)", ConsoleColor.Cyan);
 Log($"Target: net.tcp://{host}:{port}/Run8", ConsoleColor.Gray);
-if (logPath      != null) Log($"Logging to:   {logPath}",      ConsoleColor.Gray);
+Log($"Logging to:   {logPath}", ConsoleColor.Gray);
 if (discoverMode)          Log($"Discovery ON  route-map: {routeMapPath}", ConsoleColor.Cyan);
 Log("Press Ctrl+C to exit. Type 'help' for dispatcher commands.", ConsoleColor.Gray);
 Log(new string('─', 80), ConsoleColor.DarkGray);
@@ -148,5 +153,5 @@ if (routeMap != null) {
     Log($"[DISC] Route map saved → {routeMapPath}", ConsoleColor.Cyan);
 }
 
-fileWriter?.Dispose();
 Log("Done.", ConsoleColor.Gray);
+fileWriter.Dispose();
