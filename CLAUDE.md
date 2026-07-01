@@ -107,6 +107,22 @@ DSDaemon/
       RouteDiscoveryTests.cs        ← discovery state machine + RouteMap unit tests
       DispatcherCommanderTests.cs   ← verifies each command sends the right WCF message
       CommandConsoleTests.cs        ← verifies operator command-line parsing/dispatch
+  proto/
+    dsdaemon.proto                  ← gRPC contract for the server scaffold (see below) — NOT wired up yet
+  src/DSDaemon.Server/              ← scaffold: ASP.NET Core gRPC server, ungated/unauthenticated
+    DSDaemon.Server.csproj
+    Program.cs                     ← minimal Kestrel/gRPC host, HTTP/2 plaintext on :5270 (dev only)
+    Services/
+      SessionRegistryService.cs    ← OpenSession/CloseSession — issues the session_id
+      DispatcherBridgeService.cs   ← the bidi Stream RPC; folds events into SessionState, drains its Outbound queue
+    Sessions/
+      SessionManager.cs            ← in-memory session_id → SessionState registry
+      SessionState.cs              ← per-session live state; does NOT yet replicate PtcMonitor/RouteDiscoveryEngine
+  src/DSDaemon.ServerClient/        ← scaffold: gRPC client wrapper, NOT referenced by src/DSDaemon yet
+    DSDaemon.ServerClient.csproj
+    BridgeClient.cs                ← OpenSession + Stream wrapper for a future local-agent integration
+  tests/DSDaemon.Server.Tests/
+    SessionManagerTests.cs         ← registry bookkeeping + per-session isolation
 ```
 
 ## Critical wire-format detail: TrainData backing fields
@@ -307,3 +323,46 @@ next step.
 - Automatic PTC enforcement: issue `BeginHoldAITrain`/`BeginStopAITrain`/
   `BeginChangeSignal` in response to a detected authority conflict, rather than only
   flagging it
+
+## Server scaffold (exploratory — not wired into the app yet)
+
+`proto/dsdaemon.proto`, `src/DSDaemon.Server/`, and `src/DSDaemon.ServerClient/` are the
+first pieces of a bigger architectural direction: turning the local agent into a thin
+proxy for the WCF connection, and moving PTC evaluation, route discovery, and a shared,
+persisted route-topology store to a server that multiple agents (multiple Run8 world
+instances, potentially over an untrusted network) can connect to. This unlocks a real UI
+built off the server's data, and lets discovered routes accumulate across sessions
+instead of every install re-scouting the same static Mojave/Needles topology.
+
+**Current state — scaffold only:**
+- `src/DSDaemon` (the local agent) is **unchanged** and still does everything itself
+  (PtcMonitor, RouteDiscoveryEngine, DispatcherCommander all run in-process against the
+  local WCF channel, same as today). It does not talk to `DSDaemon.Server`.
+- `DSDaemon.Server` is a working ASP.NET Core gRPC host with the session handshake
+  (`SessionRegistry.OpenSession`/`CloseSession`) and the bidirectional event/command
+  stream (`DispatcherBridge.Stream`) wired up, but `SessionState.Apply` only records the
+  latest train/signal/occupied-blocks event per session — none of PtcMonitor's
+  evaluation logic or RouteDiscoveryEngine's scouting state machine has moved here yet.
+- `DSDaemon.ServerClient`'s `BridgeClient` is a usable wrapper around the generated gRPC
+  client, but nothing in `src/DSDaemon/Program.cs` calls it.
+- Auth is a placeholder: `SessionRegistryService.OpenSession` accepts any `agent_token`
+  without validating it. Don't expose this beyond localhost as-is.
+- Kestrel listens on plaintext HTTP/2 (`:5270`, no TLS) — fine for local dev, but the
+  whole point of this design is agents connecting over an untrusted network, so TLS
+  (and real per-agent credentials) are required before that's safe.
+
+**Session isolation is the load-bearing design decision** (see the header comment in
+`proto/dsdaemon.proto`): live state — trains, block occupancy, signals, discovery
+scouting — is keyed by `session_id` and must never merge across sessions, since two
+different Run8 world instances can both have a "train #5" and treating them as the same
+train would corrupt PTC evaluation. Only the *discovered route topology* (not modeled in
+this scaffold yet — see the SQLite item above) is meant to be shared and merged globally
+across every session, since the physical Mojave/Needles map itself is the same for
+everyone. Any code added to `SessionState`/`SessionManager` should preserve that split.
+
+**Proto naming gotcha worth knowing if you extend `dsdaemon.proto`:** several messages
+originally had a field named the same as their own message type (e.g. `repeated int32
+occupied_blocks` inside `message OccupiedBlocks`) — protoc's C# generator resolves that
+collision by renaming the field's C# property to `Foo_` with a trailing underscore,
+which is confusing to read later. All such fields were renamed instead (`blocks`,
+`switches`, `indications`, etc.) — keep that pattern when adding new messages.
