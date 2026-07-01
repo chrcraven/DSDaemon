@@ -1,12 +1,11 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net6.0</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>DSDaemon.ServerClient</AssemblyName>
     <RootNamespace>DSDaemon.ServerClient</RootNamespace>
-    <LangVersion>10</LangVersion>
   </PropertyGroup>
 
   <ItemGroup>

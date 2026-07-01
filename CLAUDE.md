@@ -15,11 +15,12 @@ Scope: Run8 Southern California region (Mojave Sub + Needles Sub).
 
 ## Technology decision (settled — do not reopen)
 
-**C# (.NET 6) is the only viable choice.** Run8's dispatcher interface is WCF over
+**C# (.NET 10) is the only viable choice.** Run8's dispatcher interface is WCF over
 `net.tcp` with binary message encoding. WCF is Microsoft/.NET-only; no Python, Go, or
 Rust library exists for the duplex net.tcp wire protocol. CoreWCF/System.ServiceModel
 client packages work cross-platform on .NET 6+ but Run8 itself is Windows-only, so the
-app will always run on Windows alongside Run8.
+app will always run on Windows alongside Run8. (Targets net10.0 — the current LTS —
+rather than the original net6.0, which is now out of support.)
 
 ## WCF connection details (from iecc8 source)
 
@@ -53,7 +54,7 @@ DSDaemon/
   DSDaemon.sln
   CLAUDE.md                         ← you are here
   src/DSDaemon/
-    DSDaemon.csproj                 ← net6.0, System.ServiceModel.{Duplex,NetTcp} 4.10.*
+    DSDaemon.csproj                 ← net10.0, System.ServiceModel.{Duplex,NetTcp} 4.10.*
     Program.cs                      ← entry point, arg parsing, reconnect loop, command console, discovery startup
     Run8Connector.cs                ← WCF channel lifecycle; .Channel exposes IRun8 for commands
     DispatcherCallback.cs           ← IDispatcher impl — logs callbacks; forwards to discovery engine
@@ -141,7 +142,7 @@ Dispatcher-to-Run8 DataContract namespace:
 ## Build & run
 
 ```powershell
-# Prerequisites: .NET 6 SDK on Windows (Run8 machine)
+# Prerequisites: .NET 10 SDK on Windows (Run8 machine)
 cd src/DSDaemon
 dotnet restore
 dotnet build -c Release
