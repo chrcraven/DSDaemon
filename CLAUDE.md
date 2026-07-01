@@ -157,6 +157,12 @@ a run's full output is available afterward (e.g. to hand back for debugging) eve
 nobody was watching the console live. `--log-file` overrides the path and appends to
 it instead of starting fresh.
 
+To avoid piling up one file per run forever, only the most recent 10 default-named
+logs are kept — older ones are pruned (best-effort delete) at startup, before the new
+one is created. Pruning only ever touches files matching the default `dsdaemon-*.log`
+naming scheme; an explicit `--log-file` path is never pruned, since that's the
+operator's own file to manage.
+
 ## Interactive dispatcher commands (v2)
 
 Once connected, DSDaemon reads commands from stdin (concurrently with the live callback
