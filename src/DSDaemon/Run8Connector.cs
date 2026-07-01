@@ -18,6 +18,11 @@ namespace DSDaemon {
         private DuplexChannelFactory<IRun8>? _factory;
         private IRun8?                        _channel;
 
+        /// <summary>
+        /// The live IRun8 channel. Non-null after Connect() returns successfully.
+        /// </summary>
+        public IRun8? Channel => _channel;
+
         public Run8Connector(string host, int port, DispatcherCallback callback,
                              Action<string, ConsoleColor> log) {
             _host     = host;

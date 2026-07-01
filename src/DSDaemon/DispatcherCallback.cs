@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.ServiceModel;
 using DSDaemon.Contracts;
+using DSDaemon.Discovery;
 using DSDaemon.Messages;
 
 namespace DSDaemon {
@@ -14,11 +15,18 @@ namespace DSDaemon {
     public sealed class DispatcherCallback : IDispatcher {
         private readonly Action<string, ConsoleColor> _write;
         private readonly PtcMonitor _monitor;
+        private volatile RouteDiscoveryEngine? _discovery;
 
         public DispatcherCallback(Action<string, ConsoleColor> write, PtcMonitor? monitor = null) {
             _write   = write;
             _monitor = monitor ?? new PtcMonitor();
         }
+
+        /// <summary>
+        /// Wire in a discovery engine after the WCF channel is open.
+        /// Thread-safe: uses volatile write.
+        /// </summary>
+        public void SetDiscoveryEngine(RouteDiscoveryEngine engine) => _discovery = engine;
 
         // ── Keepalive ─────────────────────────────────────────────────────────
 
@@ -70,6 +78,7 @@ namespace DSDaemon {
 
         public void SetOccupiedBlocks(OccupiedBlocksMessage m) {
             _monitor.UpdateOccupiedBlocks(m);
+            _discovery?.OnOccupiedBlocksUpdated(m);
             int blocks = m.OccupiedBlocks?.Count ?? 0;
             int manual = m.OpenManualSwitchBlocks?.Count ?? 0;
             var color  = blocks > 0 ? ConsoleColor.Yellow : ConsoleColor.DarkGray;
@@ -119,6 +128,7 @@ namespace DSDaemon {
 
         public void UpdateTrainData(TrainDataMessage m) {
             _monitor.UpdateTrain(m.Train);
+            _discovery?.OnTrainDataReceived(m.Train);
             var status = PtcMonitor.EvaluateTrain(m.Train);
             var t      = status.Train;
 

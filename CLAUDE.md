@@ -7,7 +7,8 @@ It connects to Run8 over its built-in WCF (Windows Communication Foundation) int
 receives all pushed state (signals, occupied blocks/switches, reversed switches, train data,
 sim clock) and displays it to the console with colour-coded output and optional file logging.
 
-**V1 scope: visualization only — no commands sent to Run8.**
+**V1 scope: visualization only — no commands sent to Run8 except in discovery mode.**
+**V1.5 scope: empirical route discovery via controlled AI-train scouting.**
 Scope: Run8 Southern California region (Mojave Sub + Needles Sub).
 
 ## Technology decision (settled — do not reopen)
@@ -51,9 +52,11 @@ DSDaemon/
   CLAUDE.md                         ← you are here
   src/DSDaemon/
     DSDaemon.csproj                 ← net6.0, System.ServiceModel.{Duplex,NetTcp} 4.10.*
-    Program.cs                      ← entry point, arg parsing, reconnect loop
-    Run8Connector.cs                ← WCF channel lifecycle (connect, wait, dispose)
-    DispatcherCallback.cs           ← IDispatcher impl — logs all callbacks to console
+    Program.cs                      ← entry point, arg parsing, reconnect loop, discovery startup
+    Run8Connector.cs                ← WCF channel lifecycle; .Channel exposes IRun8 for commands
+    DispatcherCallback.cs           ← IDispatcher impl — logs callbacks; forwards to discovery engine
+    PtcMonitor.cs                   ← thread-safe PTC state (signals, blocks, switches, trains)
+    TrainCommander.cs               ← ITrainCommander + TrainCommander (wraps BeginHoldAITrain)
     Contracts/
       IDispatcher.cs                ← callback interface (must match Run8 wire contract)
       IRun8.cs                      ← service interface ([ServiceContract(Name="IWCFRun8")])
@@ -75,14 +78,29 @@ DSDaemon/
       EEngineerType.cs
       EDTMFType.cs
       ESwitchState.cs
-      AIRecrewTrainMessage.cs       ← dispatcher→Run8 (unused in v1, needed to compile IRun8)
+      AIRecrewTrainMessage.cs       ← dispatcher→Run8 (needed to compile IRun8)
       DispatcherSignalMessage.cs
       DispatcherSwitchMessage.cs
-      HoldAITrainMessage.cs
+      HoldAITrainMessage.cs         ← { TrainID, HoldTrain: bool } — toggle hold on/off
       RelinquishAITrainMessage.cs
       StopAITrainMessage.cs
       TransportPlayerMessage.cs
       TransportPlayerToBlockMessage.cs
+    Discovery/
+      RouteMap.cs                   ← adjacency graph (block↔block edges with confidence counts)
+      RouteDiscoveryEngine.cs       ← state machine: Initializing→WaitingToSelect→Released→…
+  tests/DSDaemon.Tests/
+    Helpers/
+      TrainBuilder.cs               ← builds TrainData for tests
+      MessageBuilder.cs             ← builds signal/switch/block messages
+    Scenarios/
+      OverspeedTests.cs
+      BlockOccupancyTests.cs
+      SignalConflictTests.cs
+      SwitchStateTests.cs
+      PermissionTests.cs
+      TrainDisplayTests.cs
+      RouteDiscoveryTests.cs        ← discovery state machine + RouteMap unit tests
 ```
 
 ## Critical wire-format detail: TrainData backing fields
@@ -116,14 +134,71 @@ dotnet publish -c Release -r win-x64 --self-contained true -o publish/
 ## Usage
 
 ```
-DSDaemon [--host <host>] [--port <port>] [--log-file <path>]
+DSDaemon [--host <h>] [--port <p>] [--log-file <path>] [--discover] [--route-map <path>]
 
   --host       Run8 host (default: localhost)
   --port       Run8 WCF port (default: 15192)
   --log-file   Append timestamped output to this file as well as console
+  --discover   Enable empirical route discovery mode (issues BeginHoldAITrain commands)
+  --route-map  JSON path to persist the growing route map (default: route-map.json)
 ```
 
 Start Run8 first. Launch DSDaemon; it will reconnect automatically on channel fault.
+
+## Route discovery mode (v1.5)
+
+### Why empirical discovery?
+
+Run8 exposes only numeric block/switch/signal IDs over WCF. There is no parseable file
+format containing connectivity data (iecc8's XAML schemas for Mojave/Needles are empty
+stubs). The only way to learn the topology is to watch trains move.
+
+### The controlled-scout algorithm
+
+The problem with passive observation of multiple trains: if train A is in block 100 and
+block 101 becomes occupied, you can't tell whether it was train A or train B that entered
+101. With N free-running trains, ambiguity compounds.
+
+**Solution: hold everything, release one at a time.**
+
+1. On startup, `RouteDiscoveryEngine` holds every AI train it sees via `BeginHoldAITrain`.
+2. After 5 s (for the initial flood of callbacks to settle), `Start()` is called.
+3. Engine picks one held AI train as "scout", releases it (`HoldTrain=false`).
+4. Engine watches `UpdateTrainData` for the scout's `BlockID` to change.
+5. On block change: records `fromBlock → toBlock` adjacency edge in `RouteMap`, re-holds
+   the scout, picks next scout, repeats.
+6. If the scout doesn't move within 30 s (timeout), it is re-held and a different train
+   is tried.
+
+Because only one train moves at a time, every block-ID delta is unambiguously attributable
+to the scout.
+
+### RouteMap format (route-map.json)
+
+```json
+{
+  "Routes": {
+    "0": {
+      "Name": "",
+      "Blocks": {
+        "100": {
+          "Name": "Mojave Yard East",
+          "AdjacentBlocks": { "101": 14, "99": 12 }
+        }
+      }
+    }
+  }
+}
+```
+
+`AdjacentBlocks` maps neighbour block ID → number of times that transition was observed.
+High confidence (≥5) means the edge is reliable. Low confidence (1–2) may be spurious.
+
+### Thread safety in RouteDiscoveryEngine
+
+WCF callbacks arrive on concurrent threads (`ConcurrencyMode.Multiple`). The engine uses
+a single `object _lock` to protect all state. The scout-timeout `Task.Delay` runs off the
+lock and re-acquires it when it fires.
 
 ## Design philosophy: Positive Train Control (PTC)
 
