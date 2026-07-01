@@ -321,6 +321,52 @@ namespace DSDaemon.Tests.Scenarios {
         }
 
         [Fact]
+        public void ScoutReleased_RouteAlreadyReportedStop_ClearedImmediatelyOnRelease() {
+            // Run8 only pushes SetSignals on change. If the route already went
+            // Stop before the scout was released (the common real-world case —
+            // that's exactly what's blocking the train), no fresh SetSignals
+            // callback will ever arrive to trigger the reactive auto-clear.
+            // Scout selection must seed the clear from the cached state instead.
+            var (eng, _, cmdr) = Make();
+            eng.OnSignalsUpdated(new SignalsMessage {
+                Route = 0,
+                Signals = new List<ESignalIndication> { ESignalIndication.Stop },
+            });
+            eng.OnTrainDataReceived(AI(1, 100, held: true));
+            eng.Start(); // releases scout on route 0
+
+            var change = Assert.Single(cmdr.SignalsChanged);
+            Assert.Equal((0, ESignalIndication.Proceed, true), change);
+        }
+
+        [Fact]
+        public void ScoutReleased_RouteAlreadyReportedInterlockError_UnlockedImmediatelyOnRelease() {
+            var (eng, _, cmdr) = Make();
+            eng.OnInterlockErrorsUpdated(new InterlockErrorSwitchesMessage {
+                Route = 0,
+                InterlockErrorSwitches = new List<int> { 42 },
+            });
+            eng.OnTrainDataReceived(AI(1, 100, held: true));
+            eng.Start();
+
+            var thrown = Assert.Single(cmdr.SwitchesThrown);
+            Assert.Equal((42, ESwitchState.Unlock), thrown);
+        }
+
+        [Fact]
+        public void ScoutReleased_CachedStopOnOtherRoute_IsIgnored() {
+            var (eng, _, cmdr) = Make();
+            eng.OnSignalsUpdated(new SignalsMessage {
+                Route = 1,
+                Signals = new List<ESignalIndication> { ESignalIndication.Stop },
+            });
+            eng.OnTrainDataReceived(AI(1, 100, held: true)); // scout ends up on route 0
+            eng.Start();
+
+            Assert.Empty(cmdr.SignalsChanged);
+        }
+
+        [Fact]
         public void NewScout_ClearsAutoClearTrackingFromPreviousScout() {
             var (eng, _, cmdr) = Make();
             eng.OnTrainDataReceived(AI(1, 100, held: true));
@@ -339,6 +385,37 @@ namespace DSDaemon.Tests.Scenarios {
             // should be cleared again since tracking was reset.
             eng.OnSignalsUpdated(new SignalsMessage { Route = 0, Signals = new List<ESignalIndication> { ESignalIndication.Stop } });
             Assert.Equal(2, cmdr.SignalsChanged.Count);
+        }
+
+        // ── Incremental persistence ─────────────────────────────────────────────
+
+        [Fact]
+        public void RecordedAdjacency_InvokesOnAdjacencyRecordedCallback() {
+            var map  = new RouteMap();
+            var cmdr = new CapturingCommander();
+            int saveCount = 0;
+            var eng = new RouteDiscoveryEngine(map, cmdr, onAdjacencyRecorded: () => saveCount++);
+
+            eng.OnTrainDataReceived(AI(1, 100, held: true));
+            eng.Start(); // releases scout from block 100
+            Assert.Equal(0, saveCount); // no edge recorded yet
+
+            eng.OnTrainDataReceived(AI(1, 200, held: false)); // records blk 100 -> 200
+            Assert.Equal(1, saveCount);
+        }
+
+        [Fact]
+        public void SameBlock_NoTransition_DoesNotInvokeOnAdjacencyRecorded() {
+            var map  = new RouteMap();
+            var cmdr = new CapturingCommander();
+            int saveCount = 0;
+            var eng = new RouteDiscoveryEngine(map, cmdr, onAdjacencyRecorded: () => saveCount++);
+
+            eng.OnTrainDataReceived(AI(1, 100, held: true));
+            eng.Start();
+            eng.OnTrainDataReceived(AI(1, 100, held: false)); // same block, not a transition
+
+            Assert.Equal(0, saveCount);
         }
 
         // ── Timeout ───────────────────────────────────────────────────────────

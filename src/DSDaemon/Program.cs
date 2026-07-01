@@ -91,6 +91,18 @@ Log(new string('─', 80), ConsoleColor.DarkGray);
 // Load route map once; persist across reconnects.
 RouteMap? routeMap = discoverMode ? RouteMap.LoadOrCreate(routeMapPath) : null;
 
+// Defense in depth: serializes the file write itself in case a save is ever
+// triggered from more than one place at once (incremental saves already run
+// under the discovery engine's own lock, serialized with map mutation).
+var routeMapSaveLock = new object();
+void SaveRouteMap() {
+    if (routeMap == null) return;
+    lock (routeMapSaveLock) {
+        try { routeMap.Save(routeMapPath); }
+        catch (Exception ex) { Log($"[DISC] Route map save failed: {ex.Message}", ConsoleColor.Red); }
+    }
+}
+
 // ── Connect and run ───────────────────────────────────────────────────────────
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => {
@@ -141,7 +153,13 @@ while (reconnect && !cts.Token.IsCancellationRequested) {
         activeMonitor   = monitor;
 
         if (routeMap != null) {
-            discovery = new RouteDiscoveryEngine(routeMap, commander, log: Log);
+            // onAdjacencyRecorded fires synchronously under the engine's own lock
+            // (from RecordTransition), so the save must run there too rather than
+            // on a background task — RouteMap isn't synchronized against its own
+            // mutation, and a save running concurrently with the next
+            // RecordAdjacency would race on the same Routes dictionary.
+            discovery = new RouteDiscoveryEngine(routeMap, commander, log: Log,
+                onAdjacencyRecorded: SaveRouteMap);
             callback.SetDiscoveryEngine(discovery);
             // Allow 5 s for the initial flood of UpdateTrainData callbacks before scouting.
             _ = Task.Run(async () => {
@@ -169,9 +187,12 @@ while (reconnect && !cts.Token.IsCancellationRequested) {
     }
 }
 
-// Save route map on clean exit.
+// Final save on clean exit. Edges are already saved incrementally as they're
+// discovered (see onAdjacencyRecorded above), so this is mostly redundant —
+// it's kept for a definitive "saved" log line and to cover the (persistence-
+// only) case where routeMap was loaded but discovery never recorded an edge.
 if (routeMap != null) {
-    routeMap.Save(routeMapPath);
+    SaveRouteMap();
     Log($"[DISC] Route map saved → {routeMapPath}", ConsoleColor.Cyan);
 }
 
