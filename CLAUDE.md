@@ -107,6 +107,22 @@ DSDaemon/
       RouteDiscoveryTests.cs        ← discovery state machine + RouteMap unit tests
       DispatcherCommanderTests.cs   ← verifies each command sends the right WCF message
       CommandConsoleTests.cs        ← verifies operator command-line parsing/dispatch
+  proto/
+    dsdaemon.proto                  ← gRPC contract for the server scaffold (see below) — NOT wired up yet
+  src/DSDaemon.Server/              ← scaffold: ASP.NET Core gRPC server, ungated/unauthenticated
+    DSDaemon.Server.csproj
+    Program.cs                     ← minimal Kestrel/gRPC host, HTTP/2 plaintext on :5270 (dev only)
+    Services/
+      SessionRegistryService.cs    ← OpenSession/CloseSession — issues the session_id
+      DispatcherBridgeService.cs   ← the bidi Stream RPC; folds events into SessionState, drains its Outbound queue
+    Sessions/
+      SessionManager.cs            ← in-memory session_id → SessionState registry
+      SessionState.cs              ← per-session live state; does NOT yet replicate PtcMonitor/RouteDiscoveryEngine
+  src/DSDaemon.ServerClient/        ← scaffold: gRPC client wrapper, NOT referenced by src/DSDaemon yet
+    DSDaemon.ServerClient.csproj
+    BridgeClient.cs                ← OpenSession + Stream wrapper for a future local-agent integration
+  tests/DSDaemon.Server.Tests/
+    SessionManagerTests.cs         ← registry bookkeeping + per-session isolation
 ```
 
 ## Critical wire-format detail: TrainData backing fields
@@ -144,12 +160,24 @@ DSDaemon [--host <h>] [--port <p>] [--log-file <path>] [--discover] [--route-map
 
   --host       Run8 host (default: localhost)
   --port       Run8 WCF port (default: 15192)
-  --log-file   Append timestamped output to this file as well as console
+  --log-file   Override the log file path (default: dsdaemon-<timestamp>.log)
   --discover   Enable empirical route discovery mode (issues BeginHoldAITrain commands)
   --route-map  JSON path to persist the growing route map (default: route-map.json)
 ```
 
 Start Run8 first. Launch DSDaemon; it will reconnect automatically on channel fault.
+
+Every run always writes a log file (mirroring everything shown on the console) — by
+default a fresh timestamped `dsdaemon-<timestamp>.log` in the working directory, so
+a run's full output is available afterward (e.g. to hand back for debugging) even if
+nobody was watching the console live. `--log-file` overrides the path and appends to
+it instead of starting fresh.
+
+To avoid piling up one file per run forever, only the most recent 10 default-named
+logs are kept — older ones are pruned (best-effort delete) at startup, before the new
+one is created. Pruning only ever touches files matching the default `dsdaemon-*.log`
+naming scheme; an explicit `--log-file` path is never pruned, since that's the
+operator's own file to manage.
 
 ## Interactive dispatcher commands (v2)
 
@@ -172,9 +200,11 @@ quit | exit                                     Shut down DSDaemon
 Commands are parsed and dispatched by `CommandConsole.Execute`, which is independent of
 the stdin loop so it can be unit tested without a real console (see `CommandConsoleTests`).
 When `--discover` is also active, both features share the same `DispatcherCommander`
-instance — the discovery engine's scouting holds/releases and manual operator commands can
-both be in flight; there's no coordination between them, so a manual `release` on a train
-the discovery engine is currently holding as non-scout will interfere with scouting.
+instance — the discovery engine's scouting holds/releases, its autonomous signal/switch
+clearing (see below), and manual operator commands can all be in flight concurrently; there's
+no coordination between them, so a manual `release` on a train the discovery engine is
+currently holding as non-scout will interfere with scouting, and a manual `signal`/`switch`
+command on the scout's route may race with the engine's own auto-clearing.
 
 ## Route discovery mode (v1.5)
 
@@ -203,6 +233,31 @@ block 101 becomes occupied, you can't tell whether it was train A or train B tha
 
 Because only one train moves at a time, every block-ID delta is unambiguously attributable
 to the scout.
+
+### Autonomous path-clearing (aiding the scout)
+
+While a scout is `Released`, `RouteDiscoveryEngine` also clears its own path with no operator
+involvement, via the full `IDispatcherCommander` (not just `ITrainCommander`):
+
+- **Signals**: on `SetSignals` for the scout's route, any signal reported `Stop` is immediately
+  commanded to `Proceed` (`ChangeSignal(index, Proceed, automaticWorking: true)`). This relies
+  on an **unverified assumption**: `SignalsMessage.Signals` carries no ID, only a per-route
+  positional list, so the engine treats list index as `SignalID`. It's safe to get wrong (Run8
+  presumably no-ops on an unrecognized ID) but may simply have no effect — watch for
+  `[DISC-AUTO]` log lines and confirm the following `SetSignals` callback actually flips to
+  `Proceed` before trusting this on a new region.
+- **Switches**: on `SetInterlockErrorSwitches` for the scout's route, every switch ID reported
+  is commanded `Unlock`. Unlike signals, these are genuine wire `SwitchID`s (the same IDs
+  reported in `ReversedSwitches`/`UnlockedSwitches`), so this is unambiguous.
+
+Both only ever touch the scout's own route, and each signal index / switch ID is only
+commanded once per scouting run (tracked in `_clearedSignalIndices` / `_unlockedInterlockSwitches`,
+reset whenever a new scout is selected) to avoid spamming Run8 on every repeated callback.
+
+This is judged safe *only* because discovery holds every other train — with just the scout
+moving on its route, forcing every signal on that route clear cannot create a real conflicting
+movement authority. This autonomous clearing must not be reused outside discovery mode (e.g.
+for general PTC enforcement) without re-deriving that safety argument.
 
 ### RouteMap format (route-map.json)
 
@@ -268,3 +323,46 @@ next step.
 - Automatic PTC enforcement: issue `BeginHoldAITrain`/`BeginStopAITrain`/
   `BeginChangeSignal` in response to a detected authority conflict, rather than only
   flagging it
+
+## Server scaffold (exploratory — not wired into the app yet)
+
+`proto/dsdaemon.proto`, `src/DSDaemon.Server/`, and `src/DSDaemon.ServerClient/` are the
+first pieces of a bigger architectural direction: turning the local agent into a thin
+proxy for the WCF connection, and moving PTC evaluation, route discovery, and a shared,
+persisted route-topology store to a server that multiple agents (multiple Run8 world
+instances, potentially over an untrusted network) can connect to. This unlocks a real UI
+built off the server's data, and lets discovered routes accumulate across sessions
+instead of every install re-scouting the same static Mojave/Needles topology.
+
+**Current state — scaffold only:**
+- `src/DSDaemon` (the local agent) is **unchanged** and still does everything itself
+  (PtcMonitor, RouteDiscoveryEngine, DispatcherCommander all run in-process against the
+  local WCF channel, same as today). It does not talk to `DSDaemon.Server`.
+- `DSDaemon.Server` is a working ASP.NET Core gRPC host with the session handshake
+  (`SessionRegistry.OpenSession`/`CloseSession`) and the bidirectional event/command
+  stream (`DispatcherBridge.Stream`) wired up, but `SessionState.Apply` only records the
+  latest train/signal/occupied-blocks event per session — none of PtcMonitor's
+  evaluation logic or RouteDiscoveryEngine's scouting state machine has moved here yet.
+- `DSDaemon.ServerClient`'s `BridgeClient` is a usable wrapper around the generated gRPC
+  client, but nothing in `src/DSDaemon/Program.cs` calls it.
+- Auth is a placeholder: `SessionRegistryService.OpenSession` accepts any `agent_token`
+  without validating it. Don't expose this beyond localhost as-is.
+- Kestrel listens on plaintext HTTP/2 (`:5270`, no TLS) — fine for local dev, but the
+  whole point of this design is agents connecting over an untrusted network, so TLS
+  (and real per-agent credentials) are required before that's safe.
+
+**Session isolation is the load-bearing design decision** (see the header comment in
+`proto/dsdaemon.proto`): live state — trains, block occupancy, signals, discovery
+scouting — is keyed by `session_id` and must never merge across sessions, since two
+different Run8 world instances can both have a "train #5" and treating them as the same
+train would corrupt PTC evaluation. Only the *discovered route topology* (not modeled in
+this scaffold yet — see the SQLite item above) is meant to be shared and merged globally
+across every session, since the physical Mojave/Needles map itself is the same for
+everyone. Any code added to `SessionState`/`SessionManager` should preserve that split.
+
+**Proto naming gotcha worth knowing if you extend `dsdaemon.proto`:** several messages
+originally had a field named the same as their own message type (e.g. `repeated int32
+occupied_blocks` inside `message OccupiedBlocks`) — protoc's C# generator resolves that
+collision by renaming the field's C# property to `Foo_` with a trailing underscore,
+which is confusing to read later. All such fields were renamed instead (`blocks`,
+`switches`, `indications`, etc.) — keep that pattern when adding new messages.

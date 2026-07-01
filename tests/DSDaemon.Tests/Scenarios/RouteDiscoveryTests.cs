@@ -16,11 +16,25 @@ namespace DSDaemon.Tests.Scenarios {
 
         // ── Helpers ──────────────────────────────────────────────────────────
 
-        /// <summary>Minimal mock that records every Hold/Release call.</summary>
-        private sealed class CapturingCommander : ITrainCommander {
+        /// <summary>Records every command issued by the engine, including the
+        /// autonomous signal/switch clearing used to aid a released scout.</summary>
+        private sealed class CapturingCommander : IDispatcherCommander {
             public List<(int TrainId, bool IsHold)> Commands = new();
+            public List<(int SignalId, ESignalIndication Indication, bool Auto)> SignalsChanged = new();
+            public List<(int SwitchId, ESwitchState State)> SwitchesThrown = new();
+
             public void Hold(int id)    => Commands.Add((id, true));
             public void Release(int id) => Commands.Add((id, false));
+
+            public void ChangeSignal(int signalId, ESignalIndication indication, bool automaticWorking = false) =>
+                SignalsChanged.Add((signalId, indication, automaticWorking));
+
+            public void ThrowSwitch(int switchId, ESwitchState state) =>
+                SwitchesThrown.Add((switchId, state));
+
+            public void Stop(int trainId) { }
+            public void Recrew(int trainId) { }
+            public void Relinquish(int trainId, bool relinquish = true) { }
         }
 
         private static (RouteDiscoveryEngine engine, RouteMap map, CapturingCommander cmdr) Make(
@@ -196,6 +210,111 @@ namespace DSDaemon.Tests.Scenarios {
 
             Assert.Equal(1, map.GetAdjacencyConfidence(1, 500, 501));
             Assert.Equal(0, map.GetAdjacencyConfidence(0, 500, 501)); // not on route 0
+        }
+
+        // ── Autonomous signal/switch clearing (aiding the released scout) ──────
+
+        [Fact]
+        public void ReleasedScout_StopSignalOnItsRoute_IsClearedToProceed() {
+            var (eng, _, cmdr) = Make();
+            eng.OnTrainDataReceived(AI(1, 100, held: true));
+            eng.Start(); // releases scout on route 0
+
+            eng.OnSignalsUpdated(new SignalsMessage {
+                Route = 0,
+                Signals = new List<ESignalIndication> { ESignalIndication.Proceed, ESignalIndication.Stop },
+            });
+
+            var change = Assert.Single(cmdr.SignalsChanged);
+            Assert.Equal((1, ESignalIndication.Proceed, true), change);
+        }
+
+        [Fact]
+        public void ReleasedScout_StopSignalOnOtherRoute_IsIgnored() {
+            var (eng, _, cmdr) = Make();
+            eng.OnTrainDataReceived(AI(1, 100, held: true));
+            eng.Start(); // scout is on route 0
+
+            eng.OnSignalsUpdated(new SignalsMessage {
+                Route = 1,
+                Signals = new List<ESignalIndication> { ESignalIndication.Stop },
+            });
+
+            Assert.Empty(cmdr.SignalsChanged);
+        }
+
+        [Fact]
+        public void ReleasedScout_SameStopSignal_OnlyClearedOnce() {
+            var (eng, _, cmdr) = Make();
+            eng.OnTrainDataReceived(AI(1, 100, held: true));
+            eng.Start();
+
+            var msg = new SignalsMessage { Route = 0, Signals = new List<ESignalIndication> { ESignalIndication.Stop } };
+            eng.OnSignalsUpdated(msg);
+            eng.OnSignalsUpdated(msg); // repeat callback, e.g. from a periodic push
+
+            Assert.Single(cmdr.SignalsChanged);
+        }
+
+        [Fact]
+        public void NotReleased_SignalsUpdated_NoCommandIssued() {
+            var (eng, _, cmdr) = Make();
+            // Still Initializing — no scout released yet.
+            eng.OnSignalsUpdated(new SignalsMessage {
+                Route = 0,
+                Signals = new List<ESignalIndication> { ESignalIndication.Stop },
+            });
+
+            Assert.Empty(cmdr.SignalsChanged);
+        }
+
+        [Fact]
+        public void ReleasedScout_InterlockErrorOnItsRoute_IsUnlocked() {
+            var (eng, _, cmdr) = Make();
+            eng.OnTrainDataReceived(AI(1, 100, held: true));
+            eng.Start();
+
+            eng.OnInterlockErrorsUpdated(new InterlockErrorSwitchesMessage {
+                Route = 0,
+                InterlockErrorSwitches = new List<int> { 42 },
+            });
+
+            var thrown = Assert.Single(cmdr.SwitchesThrown);
+            Assert.Equal((42, ESwitchState.Unlock), thrown);
+        }
+
+        [Fact]
+        public void ReleasedScout_SameInterlockError_OnlyUnlockedOnce() {
+            var (eng, _, cmdr) = Make();
+            eng.OnTrainDataReceived(AI(1, 100, held: true));
+            eng.Start();
+
+            var msg = new InterlockErrorSwitchesMessage { Route = 0, InterlockErrorSwitches = new List<int> { 42 } };
+            eng.OnInterlockErrorsUpdated(msg);
+            eng.OnInterlockErrorsUpdated(msg);
+
+            Assert.Single(cmdr.SwitchesThrown);
+        }
+
+        [Fact]
+        public void NewScout_ClearsAutoClearTrackingFromPreviousScout() {
+            var (eng, _, cmdr) = Make();
+            eng.OnTrainDataReceived(AI(1, 100, held: true));
+            eng.OnTrainDataReceived(AI(2, 200, held: true));
+            eng.Start(); // scout #1 released
+
+            eng.OnSignalsUpdated(new SignalsMessage { Route = 0, Signals = new List<ESignalIndication> { ESignalIndication.Stop } });
+            Assert.Single(cmdr.SignalsChanged);
+
+            // Scout #1 moves and is re-held; #2 becomes the new scout.
+            eng.OnTrainDataReceived(AI(1, 150, held: false));
+            eng.OnTrainDataReceived(AI(2, 200, held: true));
+            Assert.Equal(2, eng.ScoutTrainId);
+
+            // Same signal index reported Stop again for the new scout's run —
+            // should be cleared again since tracking was reset.
+            eng.OnSignalsUpdated(new SignalsMessage { Route = 0, Signals = new List<ESignalIndication> { ESignalIndication.Stop } });
+            Assert.Equal(2, cmdr.SignalsChanged.Count);
         }
 
         // ── Timeout ───────────────────────────────────────────────────────────

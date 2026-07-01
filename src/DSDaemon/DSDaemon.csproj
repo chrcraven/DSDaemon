@@ -9,6 +9,7 @@
     <RootNamespace>DSDaemon</RootNamespace>
     <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
     <LangVersion>10</LangVersion>
+    <PackageLicenseExpression>GPL-3.0-or-later</PackageLicenseExpression>
   </PropertyGroup>
 
   <ItemGroup>

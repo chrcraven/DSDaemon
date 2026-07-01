@@ -10,8 +10,10 @@ namespace DSDaemon {
 
     /// <summary>
     /// Full outbound command surface: signals, switches, and AI train orders.
-    /// Extends ITrainCommander so RouteDiscoveryEngine's scouting logic keeps
-    /// working unchanged — it only ever needs Hold/Release.
+    /// Extends ITrainCommander so callers that only need Hold/Release (e.g. code
+    /// depending on the narrower interface) still work against it unchanged.
+    /// RouteDiscoveryEngine itself takes the full interface — it also clears
+    /// signals/switches autonomously to aid its released scout.
     /// </summary>
     public interface IDispatcherCommander : ITrainCommander {
         void ChangeSignal(int signalId, ESignalIndication indication, bool automaticWorking = false);

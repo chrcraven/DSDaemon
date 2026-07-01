@@ -1,0 +1,243 @@
+syntax = "proto3";
+
+package dsdaemon.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option csharp_namespace = "DSDaemon.Grpc";
+
+// ═══════════════════════════════════════════════════════════════════════
+// Session handshake
+//
+// A "session" is one local agent's live connection to one Run8 world
+// instance. Unary call before opening the Stream below; establishes the
+// agent's identity and hands back an opaque session_id that the agent
+// attaches as call metadata ("session-id") on the streaming RPC. All
+// server-side live state (trains, blocks, signals, discovery scouting)
+// is keyed by session_id and never merged across sessions — only the
+// discovered route topology is shared/merged globally (see RouteTopology
+// below, sketched separately from this transport contract).
+// ═══════════════════════════════════════════════════════════════════════
+
+service SessionRegistry {
+  rpc OpenSession(OpenSessionRequest) returns (OpenSessionReply);
+  rpc CloseSession(CloseSessionRequest) returns (CloseSessionReply);
+}
+
+message OpenSessionRequest {
+  string agent_token   = 1; // per-install credential, validated by an auth interceptor
+  string world_label   = 2; // operator-supplied, e.g. "Mojave Sub - solo run"
+  string agent_version = 3;
+}
+
+message OpenSessionReply {
+  string session_id = 1;
+}
+
+message CloseSessionRequest {
+  string session_id = 1;
+}
+
+message CloseSessionReply {}
+
+// ═══════════════════════════════════════════════════════════════════════
+// The bridge itself
+//
+// One bidirectional stream per session, opened after OpenSession. Mirrors
+// the existing local WCF duplex channel one level up: the agent still
+// owns the IDispatcher callback / IRun8 channel to Run8, and this stream
+// just relays those same events/commands to and from the server instead
+// of a local PtcMonitor/RouteDiscoveryEngine/DispatcherCommander.
+// ═══════════════════════════════════════════════════════════════════════
+
+service DispatcherBridge {
+  // session_id travels in gRPC call metadata (key "session-id"), not
+  // per-message, since it's constant for the lifetime of the stream.
+  rpc Stream(stream AgentEvent) returns (stream ServerCommand);
+}
+
+// Agent → Server: one variant per DSDaemon.Contracts.IDispatcher callback
+// (src/DSDaemon/Contracts/IDispatcher.cs).
+message AgentEvent {
+  oneof payload {
+    SimulationState sim_state             = 1;
+    PermissionUpdate permission           = 2;
+    Signals signals                       = 3;
+    OccupiedBlocks occupied_blocks        = 4;
+    OccupiedSwitches occupied_switches    = 5;
+    ReversedSwitches reversed_switches    = 6;
+    UnlockedSwitches unlocked_switches    = 7;
+    InterlockErrorSwitches interlock_errors = 8;
+    TrainData train                       = 9;
+    RadioText radio                       = 10;
+    Dtmf dtmf                             = 11;
+  }
+}
+
+// Server → Agent: one variant per DSDaemon.IDispatcherCommander method
+// (src/DSDaemon/DispatcherCommander.cs), which in turn wraps
+// DSDaemon.Contracts.IRun8's outbound commands.
+message ServerCommand {
+  oneof payload {
+    ChangeSignal change_signal     = 1;
+    ThrowSwitch throw_switch       = 2;
+    HoldAiTrain hold_ai_train       = 3; // hold_train field selects Hold vs Release
+    StopAiTrain stop                = 4;
+    RecrewAiTrain recrew            = 5;
+    RelinquishAiTrain relinquish    = 6;
+    RadioText radio_out              = 7;
+  }
+}
+
+// ── Enums ────────────────────────────────────────────────────────────
+// Mirrored 1:1 (same ordinals) against the C# enums in src/DSDaemon/Messages/
+// so translation is a straight numeric cast, not a lookup table. Because
+// proto3 gives every unset field the zero value, and STOP/NORMAL/NONE are
+// legitimate ordinal-0 values here, an agent must always set these fields
+// explicitly — never rely on "unset" meaning anything semantic.
+
+enum SignalIndication {
+  STOP    = 0;
+  PROCEED = 1;
+  FLEET   = 2;
+  FLAG_BY = 3;
+}
+
+enum SwitchState {
+  NORMAL  = 0;
+  REVERSE = 1;
+  UNLOCK  = 2;
+  RELOCK  = 3;
+}
+
+enum EngineerType {
+  ENGINEER_NONE   = 0;
+  ENGINEER_PLAYER = 1;
+  ENGINEER_AI     = 2;
+}
+
+enum DispatcherPermission {
+  NO_CHANGE = 0;
+  GRANTED   = 1;
+  RESCINDED = 2;
+  OBSERVER  = 3;
+}
+
+enum DtmfType {
+  DTMF_NONE           = 0;
+  DTMF_DISPATCH_TONE  = 1;
+  DTMF_EMERGENCY_TONE = 2;
+}
+
+// ── Agent → Server payloads (mirror Messages/*.cs field-for-field) ─────
+
+message SimulationState {
+  bool is_client = 1;
+  google.protobuf.Timestamp simulation_time = 2;
+}
+
+message PermissionUpdate {
+  bool ai_permission = 1;
+  DispatcherPermission permission = 2;
+}
+
+message Signals {
+  int32 route = 1;
+  // Positional list, index i is signal i's current indication — see
+  // RouteDiscoveryEngine's documented SignalID-is-unverified caveat.
+  repeated SignalIndication indications = 2;
+}
+
+// Note: fields below are named to avoid colliding with their own message
+// type name (e.g. NOT "repeated int32 occupied_blocks" inside message
+// OccupiedBlocks) — protoc's C# codegen renames a colliding field to
+// Foo_ with a trailing underscore, which is confusing to read later.
+
+message OccupiedBlocks {
+  int32 route = 1;
+  repeated int32 blocks = 2;
+  repeated int32 open_manual_switch_blocks = 3;
+}
+
+message OccupiedSwitches {
+  int32 route = 1;
+  repeated int32 switches = 2;
+}
+
+message ReversedSwitches {
+  int32 route = 1;
+  repeated int32 switches = 2;
+}
+
+message UnlockedSwitches {
+  int32 route = 1;
+  repeated int32 switches = 2;
+}
+
+message InterlockErrorSwitches {
+  int32 route = 1;
+  repeated int32 switches = 2;
+}
+
+message TrainData {
+  int32 train_id = 1;
+  int32 block_id = 2;
+  string railroad_initials = 3;
+  int32 loco_number = 4;
+  string train_symbol = 5;
+  float train_speed_mph = 6;
+  int32 train_speed_limit_mph = 7;
+  bool holding_for_dispatcher = 8;
+  bool relinquish_when_stopped = 9;
+  EngineerType engineer_type = 10;
+  string engineer_name = 11;
+  int32 train_weight_tons = 12;
+  int32 train_length_feet = 13;
+  int32 axle_count = 14;
+  float hp_per_ton = 15;
+}
+
+message RadioText {
+  int32 channel = 1;
+  string text = 2;
+}
+
+message Dtmf {
+  int32 channel = 1;
+  DtmfType dtmf_type = 2;
+  string tone = 3;
+  string tower_description = 4;
+}
+
+// ── Server → Agent payloads (mirror DispatcherCommander's outbound calls) ─
+
+message ChangeSignal {
+  int32 signal_id = 1;
+  SignalIndication indication = 2;
+  bool automatic_working = 3;
+}
+
+message ThrowSwitch {
+  int32 switch_id = 1;
+  SwitchState state = 2;
+}
+
+// Mirrors HoldAITrainMessage — hold_train=true holds, false releases.
+// (DispatcherCommander.Hold/.Release are just this field flipped.)
+message HoldAiTrain {
+  int32 train_id = 1;
+  bool hold_train = 2;
+}
+
+message StopAiTrain {
+  int32 train_id = 1;
+}
+
+message RecrewAiTrain {
+  int32 train_id = 1;
+}
+
+message RelinquishAiTrain {
+  int32 train_id = 1;
+  bool relinquish_train = 2;
+}
