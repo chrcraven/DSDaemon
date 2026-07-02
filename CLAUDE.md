@@ -93,6 +93,12 @@ DSDaemon/
     Discovery/
       RouteMap.cs                   ← adjacency graph (block↔block edges with confidence counts)
       RouteDiscoveryEngine.cs       ← state machine: Initializing→WaitingToSelect→Released→…
+      StaticImport/
+        TrackDatabaseFile.cs               ← parses Run8's TrackDatabase.r8 (section connectivity)
+        BlockDetectorDatabaseFile.cs       ← parses BlockDetectorDatabase.r8 (BlockID → section grouping)
+        DispatcherSwitchIconDatabaseFile.cs ← parses DispatcherSwitchIconDatabase.r8 (SwitchID + Route ID)
+        RouteNameLookup.cs                 ← hardcoded route-folder-name → Route ID fallback table
+        StaticRouteMapImporter.cs          ← orchestrates the above into RouteMap adjacency (see below)
   tests/DSDaemon.Tests/
     Helpers/
       TrainBuilder.cs               ← builds TrainData for tests
@@ -108,6 +114,7 @@ DSDaemon/
       RouteDiscoveryTests.cs        ← discovery state machine + RouteMap unit tests
       DispatcherCommanderTests.cs   ← verifies each command sends the right WCF message
       CommandConsoleTests.cs        ← verifies operator command-line parsing/dispatch
+      StaticRouteMapImportTests.cs  ← parser + importer tests against synthetic .r8 fixtures
   proto/
     dsdaemon.proto                  ← gRPC contract for the server scaffold (see below) — NOT wired up yet
   src/DSDaemon.Server/              ← scaffold: ASP.NET Core gRPC server, ungated/unauthenticated
@@ -158,12 +165,16 @@ dotnet publish -c Release -r win-x64 --self-contained true -o publish/
 
 ```
 DSDaemon [--host <h>] [--port <p>] [--log-file <path>] [--discover] [--route-map <path>]
+         [--routes-dir <path>]
 
-  --host       Run8 host (default: localhost)
-  --port       Run8 WCF port (default: 15192)
-  --log-file   Override the log file path (default: dsdaemon-<timestamp>.log)
-  --discover   Enable empirical route discovery mode (issues BeginHoldAITrain commands)
-  --route-map  JSON path to persist the growing route map (default: route-map.json)
+  --host        Run8 host (default: localhost)
+  --port        Run8 WCF port (default: 15192)
+  --log-file    Override the log file path (default: dsdaemon-<timestamp>.log)
+  --discover    Enable empirical route discovery mode (issues BeginHoldAITrain commands)
+  --route-map   JSON path to persist the growing route map (default: route-map.json)
+  --routes-dir  Root directory with one subfolder per installed Run8 route; parses each
+                route's TrackDatabase.r8 + BlockDetectorDatabase.r8 into route-map.json as
+                a static baseline at startup (see "Static route-map import" below)
 ```
 
 Start Run8 first. Launch DSDaemon; it will reconnect automatically on channel fault.
@@ -339,6 +350,87 @@ route ID that doesn't cleanly divide out.
 WCF callbacks arrive on concurrent threads (`ConcurrencyMode.Multiple`). The engine uses
 a single `object _lock` to protect all state. The scout-timeout `Task.Delay` runs off the
 lock and re-acquires it when it fires.
+
+### Static route-map import (from installed Run8 game files)
+
+Empirical scouting exists because Run8 exposes no parseable connectivity data over the
+WCF interface itself. But Run8's own installed game files *do* contain the full track
+topology — reverse-engineered by the third-party, GPL-unrelated project
+[Puyodead1/Run8-V3-reverse-engineering](https://github.com/Puyodead1/Run8-V3-reverse-engineering)
+(unaffiliated with Run8; format docs under `docs/*.md`, not vendored into this repo).
+`StaticRouteMapImporter` (`Discovery/StaticImport/`) parses these files directly into
+`RouteMap` adjacency at startup via `--routes-dir`, giving discovery a complete baseline
+instead of starting from zero blocks.
+
+**Files parsed, and what each is validated to mean** (validated byte-exact against real
+BNSF_NeedlesSub game files supplied during development — every byte of every sample file
+was consumed with no leftover and no implausible field value):
+
+- **`TrackDatabase.r8`** — per-route track section geometry and connectivity
+  (`Next Section Indices`). The published format doc's `TrackNode` offset table is wrong —
+  it implies a 75-byte node, but the real node is **79 bytes** (`Tangent Degrees` is a full
+  `Vector3`, not the truncated field the doc's offsets imply). Found by brute-forcing node
+  width until the entire file parsed to an exact byte count; `TrackDatabaseFile.cs` skips
+  node geometry entirely and keeps only `Section Index` + `Next Section Indices` +
+  `IsCtcSwitch`, since that's all adjacency derivation needs.
+- **`BlockDetectorDatabase.r8`** — the bridge between `TrackDatabase.r8`'s section-ID space
+  and the live dispatcher `BlockID` space. `BlockDetector.Index` is the local part of the
+  live `BlockID` (see the composite-encoding note above); `TrackIndices[]` are
+  `TrackDatabase.r8` `Section Index` values belonging to that block. Confirmed by resolving
+  every `TrackIndices` reference in the sample against real `TrackDatabase.r8` sections:
+  100% resolved (3,796/3,796).
+- **`DispatcherSwitchIconDatabase.r8`** — `RoutePrefix` is the numeric Route ID (matches
+  the Route Name→ID table in the reverse-engineering repo's `GeneralInfo.md`, e.g. `110` for
+  `BNSF_NeedlesSub`) and `Index` is the local part of the live wire `SwitchID`. Confirmed
+  directly: every entry in the Needles Sub sample carried `RoutePrefix == 110`, and the
+  sample's 66 switch icons matched `TrackDatabase.r8`'s 66 `IsCtcSwitch`-flagged sections.
+  The format doc's `(String) Image Name` field (present when `Version == 2`, the only
+  version observed) is **not** the nibble-swapped `R8String` encoding used elsewhere in
+  Run8's formats — it's .NET's native `BinaryWriter`/`BinaryReader` string encoding (7-bit
+  length prefix + UTF-8), so plain `BinaryReader.ReadString()` decodes it correctly.
+- **`DispatcherBlockLightDatabase.r8` / `DispatcherSignalControllerDatabase.r8`** — parsed
+  and validated byte-exact during investigation (dispatcher-panel layout data), but **not**
+  wired into the importer — nothing in `RouteMap` currently consumes signal-panel data, and
+  parsing them didn't independently confirm `RouteDiscoveryEngine`'s existing "SignalsMessage
+  list-position = SignalID" assumption (a live-wire question these static files don't touch).
+
+**How adjacency is derived** (`StaticRouteMapImporter.DeriveEdges`): group every
+`TrackDatabase.r8` section by its owning `BlockDetectorDatabase.r8` block (`Index`), then
+walk each section's `Next Section Indices` — two blocks are adjacent if any section in one
+connects directly to any section in the other. Sections not covered by any block detector
+(e.g. ones belonging to a neighbouring route not present under `--routes-dir` — a real
+Needles Sub sample had ~2,000 `Next Section Indices` pointing outside its own 4,176
+sections, presumably into an adjoining sub's file) simply can't contribute an edge and are
+silently skipped, rather than guessed at.
+
+**Route ID resolution**: prefers the `RoutePrefix` baked into that route's own
+`DispatcherSwitchIconDatabase.r8` (comes from the install itself); falls back to matching
+the route's folder name against `RouteNameLookup.cs` (hardcoded from `GeneralInfo.md`) only
+when that file is missing/empty (a route with no CTC switches) or inconsistent. A route
+folder whose ID can't be resolved either way is skipped with a warning — never guessed.
+
+**Directory layout is caller-provided, not auto-detected.** `--routes-dir` must point at a
+directory containing one subfolder per route, each holding that route's own
+`TrackDatabase.r8` + `BlockDetectorDatabase.r8` (+ optional switch-icon file) directly. This
+was a deliberate choice: Run8's actual on-disk install layout (e.g. whether routes live
+under a `Content/Routes/<RouteName>/` path) was never verified against a real installation,
+so the importer doesn't guess at or hardcode that structure — point `--routes-dir` at
+whatever directory already holds the per-route subfolders.
+
+**Confidence semantics**: each derived edge calls `RouteMap.RecordAdjacency` exactly once,
+identical to a single empirical scout observation — it is **not** pre-boosted to the "≥5 =
+high confidence" threshold described above, even though it comes from authoritative game
+data rather than one ambiguous sighting. A statically-derived edge with a single parallel
+track between two blocks will show confidence 1 until either more static edges land on it
+(e.g. double track) or live discovery reinforces it. Revisit this if the low starting
+confidence proves misleading in practice.
+
+**Runs once at startup, independent of `--discover`.** Static import happens before any WCF
+connection is attempted and works even without `--discover` (useful for just producing/
+refreshing `route-map.json` from installed files without running Run8 at all). When both
+flags are given, import seeds `route-map.json` first and `RouteDiscoveryEngine` then keeps
+running normally against the live game — it reinforces or extends the static baseline, it
+doesn't get skipped or replaced by it.
 
 ## Design philosophy: Positive Train Control (PTC)
 

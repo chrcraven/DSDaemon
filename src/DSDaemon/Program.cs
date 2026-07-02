@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using DSDaemon;
 using DSDaemon.Discovery;
+using DSDaemon.Discovery.StaticImport;
 
 // Default log naming/retention: only the most recent MaxLogFilesToKeep
 // default-named logs are kept; this pruning never applies to an explicit
@@ -20,26 +21,32 @@ string  logPath      = $"{DefaultLogPrefix}{DateTime.Now:yyyyMMdd-HHmmss}{Defaul
 bool    logPathSet   = false;
 bool    discoverMode = false;
 string  routeMapPath = "route-map.json";
+string? routesDir    = null;
 
 for (int i = 0; i < args.Length; i++) {
     switch (args[i]) {
-        case "--host"      when i + 1 < args.Length: host         = args[++i]; break;
-        case "--port"      when i + 1 < args.Length: port         = int.Parse(args[++i]); break;
-        case "--log-file"  when i + 1 < args.Length: logPath      = args[++i]; logPathSet = true; break;
-        case "--route-map" when i + 1 < args.Length: routeMapPath = args[++i]; break;
+        case "--host"       when i + 1 < args.Length: host         = args[++i]; break;
+        case "--port"       when i + 1 < args.Length: port         = int.Parse(args[++i]); break;
+        case "--log-file"   when i + 1 < args.Length: logPath      = args[++i]; logPathSet = true; break;
+        case "--route-map"  when i + 1 < args.Length: routeMapPath = args[++i]; break;
+        case "--routes-dir" when i + 1 < args.Length: routesDir    = args[++i]; break;
         case "--discover":  discoverMode = true; break;
         case "-h":
         case "--help":
             Console.WriteLine("Usage: DSDaemon [--host <h>] [--port <p>] [--log-file <path>]");
-            Console.WriteLine("                [--discover] [--route-map <path>]");
-            Console.WriteLine("  --host       Run8 host (default: localhost)");
-            Console.WriteLine($"  --port       Run8 WCF port (default: {port})");
-            Console.WriteLine("  --log-file   Append all output to this file as well");
-            Console.WriteLine( "               (default: dsdaemon-<timestamp>.log — always written, so a");
-            Console.WriteLine( "               run's output can be handed back for debugging; only the");
-            Console.WriteLine($"               last {MaxLogFilesToKeep} default-named logs are kept, older ones are pruned)");
-            Console.WriteLine("  --discover   Enable empirical route discovery mode");
-            Console.WriteLine("  --route-map  Route map JSON path (default: route-map.json)");
+            Console.WriteLine("                [--discover] [--route-map <path>] [--routes-dir <path>]");
+            Console.WriteLine("  --host        Run8 host (default: localhost)");
+            Console.WriteLine($"  --port        Run8 WCF port (default: {port})");
+            Console.WriteLine("  --log-file    Append all output to this file as well");
+            Console.WriteLine( "                (default: dsdaemon-<timestamp>.log — always written, so a");
+            Console.WriteLine( "                run's output can be handed back for debugging; only the");
+            Console.WriteLine($"                last {MaxLogFilesToKeep} default-named logs are kept, older ones are pruned)");
+            Console.WriteLine("  --discover    Enable empirical route discovery mode");
+            Console.WriteLine("  --route-map   Route map JSON path (default: route-map.json)");
+            Console.WriteLine("  --routes-dir  Root directory holding one subfolder per installed Run8 route;");
+            Console.WriteLine("                on startup, parses each route's TrackDatabase.r8 +");
+            Console.WriteLine("                BlockDetectorDatabase.r8 into the route map as a static baseline");
+            Console.WriteLine("                (loads/saves route-map.json even without --discover)");
             return;
     }
 }
@@ -85,11 +92,15 @@ Log($"Target: net.tcp://{host}:{port}/Run8", ConsoleColor.Gray);
 Log($"Logging to:   {logPath}", ConsoleColor.Gray);
 if (prunedCount > 0)       Log($"Pruned {prunedCount} old log file(s), keeping the last {MaxLogFilesToKeep}", ConsoleColor.DarkGray);
 if (discoverMode)          Log($"Discovery ON  route-map: {routeMapPath}", ConsoleColor.Cyan);
+if (routesDir != null)     Log($"Static import ON  routes-dir: {routesDir}", ConsoleColor.Cyan);
 Log("Press Ctrl+C to exit. Type 'help' for dispatcher commands.", ConsoleColor.Gray);
 Log(new string('─', 80), ConsoleColor.DarkGray);
 
-// Load route map once; persist across reconnects.
-RouteMap? routeMap = discoverMode ? RouteMap.LoadOrCreate(routeMapPath) : null;
+// Load route map once; persist across reconnects. Needed either for live
+// discovery or for a one-time static import (or both, sharing the same map
+// and file — the static import just seeds a baseline that discovery keeps
+// building on).
+RouteMap? routeMap = (discoverMode || routesDir != null) ? RouteMap.LoadOrCreate(routeMapPath) : null;
 
 // Defense in depth: serializes the file write itself in case a save is ever
 // triggered from more than one place at once (incremental saves already run
@@ -101,6 +112,15 @@ void SaveRouteMap() {
         try { routeMap.Save(routeMapPath); }
         catch (Exception ex) { Log($"[DISC] Route map save failed: {ex.Message}", ConsoleColor.Red); }
     }
+}
+
+// Static import runs once at startup, before any WCF connection — it's pure
+// file I/O against the local Run8 install, independent of discovery/reconnect.
+if (routeMap != null && routesDir != null) {
+    var result = StaticRouteMapImporter.ImportAll(routeMap, routesDir, Log);
+    Log($"[STATIC] Imported {result.RoutesImported} route(s), {result.EdgesRecorded} block edge(s) total",
+        ConsoleColor.Cyan);
+    SaveRouteMap();
 }
 
 // ── Connect and run ───────────────────────────────────────────────────────────
